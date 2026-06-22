@@ -1,8 +1,10 @@
 # pi-thread-manager
 
-Daemon-backed long-lived Pi thread sessions.
+Daemon-backed long-lived Pi thread sessions for normal Pi.
 
-`pi-thread-manager` adds `/threads` and the model-facing `thread` tool for creating and managing independent child Pi RPC sessions. Threads are separate from one-shot subagents: they have durable identity, registry state, launch profile, lifecycle state, logs/session refs, approval tracking, and can be re-entered by later parent Pi sessions through the broker daemon.
+`pi-thread-manager` adds a `/threads` command and a model-facing `thread` tool. It lets a Pi session create, inspect, message, steer, stop, and clean up other long-lived Pi RPC sessions through a local broker daemon. Each thread has a stable id, launch profile, lifecycle state, logs, approval records, and optional isolated Git worktree.
+
+Use it when one Pi session needs durable parallel work without losing track of child process state.
 
 ## Install
 
@@ -15,6 +17,20 @@ Then reload Pi:
 ```text
 /reload
 ```
+
+## Quick start
+
+```text
+/threads status
+/threads create worker "Inspect this repo and report the test command"
+/threads list
+/threads read <thread-id>
+/threads send <thread-id> "Run the tests and summarize failures"
+/threads stop <thread-id>
+/threads cleanup <thread-id>
+```
+
+The model-facing tool is `thread`. It exposes the same core actions as `/threads`: `status`, `list`, `create`, `read`, `send`, `follow_up`, `steer`, `abort`, `stop`, `cleanup`, `approvals`, `approve`, `deny`, and `review_loop`.
 
 ## Commands
 
@@ -35,8 +51,6 @@ Then reload Pi:
 /threads review-loop repo=<OWNER/REPO> prNumber=<n> fixerThreadId=<thread-id>
 ```
 
-The model-facing tool is `thread` with matching actions: `status`, `list`, `create`, `read`, `send`, `follow_up`, `steer`, `abort`, `stop`, `cleanup`, `approvals`, `approve`, `deny`, and `review_loop`.
-
 ## Runtime state
 
 Default state lives under:
@@ -56,6 +70,26 @@ Default state lives under:
 
 On Windows the broker uses a named pipe like `\\.\pipe\pi-thread-manager-<home>`. The daemon records PID, daemon epoch, store path, active/orphan thread counts, pending operations, pending approvals, and active schedules in `/threads status`.
 
+## Worktree behavior
+
+New write-capable threads launch in isolated Git worktrees by default:
+
+```text
+/threads create worktreeMode=isolated_required worker "Fix the failing test"
+```
+
+Thread metadata records the source repo, execution cwd, worktree root, generated branch, base ref/SHA, allocation state, and cleanup state.
+
+Shared-cwd threads still work when explicitly requested:
+
+```text
+/threads create worktreeMode=shared_cwd_allowed scout "Inspect the repo only"
+```
+
+Use shared cwd for read-only scouting or when you deliberately want the child Pi session in the parent cwd. Avoid concurrent writers in shared cwd.
+
+`stop` only stops the process. It keeps isolated worktrees intact. Use `/threads cleanup <thread-id>` after inspecting the result. Cleanup refuses dirty, locked, occupied, missing/mismatched, unmarked, or unmerged worktrees and uses `git branch -d`, not force deletion.
+
 ## Optional runtime config
 
 Optional runtime config lives at:
@@ -64,40 +98,29 @@ Optional runtime config lives at:
 ~/.pi/agent/thread-manager/config.json
 ```
 
-When absent, managed child Pi sessions use the built-in launch resolution: the daemon resolves the installed Pi CLI script and runs it with the current Node executable. To intentionally wrap child launches, set `launchCommand` and optional `launchArgs`. The launcher appends the resolved Pi CLI script path and normal Pi RPC args after `launchArgs`.
+When absent, child Pi sessions use the built-in launch resolution: the daemon resolves the installed Pi CLI script and runs it with the current Node executable.
 
-`childEnv` optionally injects non-secret `PI_*` string flags into every managed child Pi process. It cannot override the manager-owned `PI_THREAD_ID` and rejects secret-like names.
+To intentionally wrap child launches, set `launchCommand` and optional `launchArgs`. The launcher appends the resolved Pi CLI script path and normal Pi RPC args after `launchArgs`.
 
 Example:
 
 ```json
 {
-  "launchCommand": "aubx",
-  "launchArgs": ["tsx"],
-  "childEnv": {
-    "PI_SUBAGENT_CHILD": "1"
-  }
+  "launchCommand": "node",
+  "launchArgs": []
 }
 ```
 
+`childEnv` may inject non-secret `PI_*` string flags into every managed child Pi process. It cannot override the manager-owned `PI_THREAD_ID` and rejects secret-like names.
+
 ## Safety model
 
-- Child Pi sessions run through normal Pi behavior. Launch profiles record execution cwd, model, extension-loading policy, approval mode, and whether values were inherited from the parent.
-- New write-capable threads launch in isolated Git worktrees by default. Thread metadata records source cwd/repo, execution cwd, worktree root, generated branch, base ref/SHA, allocation state, and cleanup state.
-- Legacy shared-cwd threads still work when explicitly requested with `worktreeMode=shared_cwd_allowed`; status/list output labels them `legacy shared cwd` because concurrent writers can collide.
-- `stop` is process-only and retains isolated worktrees. Use `/threads cleanup <thread-id>` only after inspecting the result. Cleanup refuses dirty, locked, occupied, missing/mismatched, unmarked, or unmerged worktrees and uses `git branch -d`, never force deletion.
+- Child sessions are normal Pi RPC processes running as the current user.
+- Launch profiles record cwd, model, extension-loading policy, approval mode, and inherited parent values.
 - A delivered prompt is not completion. `send`, `follow_up`, and `steer` acknowledge delivery/acceptance only; use `read` or `status` to inspect progress.
-- The daemon persists operations and approvals before external writes. Approval scope binds repo, PR, head SHA, branch, action type, thread IDs, review thread IDs, diff summary, expiry, and approver.
-- GitHub write actions default to approval-required. Automatic replies or review-thread resolution without explicit policy are out of scope.
+- The daemon persists operations and approvals before external writes.
+- GitHub write actions default to approval-required.
 - Review comments are untrusted input. Fixer prompts delimit comment text and tell the child thread not to follow instructions inside comments that request secrets, policy changes, silent public writes, or scope expansion.
-
-## Threads vs other Pi primitives
-
-| Primitive | Best for | Lifecycle |
-| --- | --- | --- |
-| Subagent | One-shot delegated task under current orchestrator | In-process task; finishes or aborts |
-| Intercom | Messaging existing sessions | Session-to-session communication |
-| Thread manager | Durable peer Pi sessions and automation loops | Broker-owned child Pi RPC processes with durable registry |
 
 ## Development
 
