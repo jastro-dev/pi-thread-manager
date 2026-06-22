@@ -1,0 +1,9 @@
+{
+  "launchCommand": "aubx",
+  "launchArgs": [
+    "tsx"
+  ],
+  "childEnv": {
+    "PI_SUBAGENT_CHILD": "1"
+  }
+}
