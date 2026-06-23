@@ -622,6 +622,132 @@ test("cleanup removes stopped isolated worktree", async () => {
 	assert.equal((store.threads[thread.id].worktree as Extract<ThreadWorktree, { mode: "isolated" }>).cleanupState, "removed");
 });
 
+test("concurrent cleanup calls do not downgrade removed isolated worktree state", async () => {
+	const sourceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "thread-source-"));
+	const executionCwd = path.join(sourceCwd, "..", "source-thread-concurrent-clean");
+	let cleanupCalls = 0;
+	let finishFirst!: () => void;
+	let firstStarted!: () => void;
+	const firstStartedPromise = new Promise<void>((resolve) => {
+		firstStarted = resolve;
+	});
+	const finishFirstPromise = new Promise<void>((resolve) => {
+		finishFirst = resolve;
+	});
+	const worktreeManager: WorktreeManagerPort = {
+		...createFakeWorktreeManager({ sourceCwd, executionCwd }),
+		async cleanupWorktree() {
+			cleanupCalls += 1;
+			if (cleanupCalls === 1) {
+				firstStarted();
+				await finishFirstPromise;
+				return { state: "removed", message: "removed", cleanedAt: "2026-01-01T00:00:00.000Z" };
+			}
+			return { state: "manual_action_required", message: "second cleanup should not run" };
+		},
+	};
+	const { service, statePath, managerDir } = await createService({ worktreeManager });
+	const thread = await service.createThread({ cwd: sourceCwd, createdBy: "test" });
+	await service.stopThread(thread.id);
+
+	const first = service.cleanupThread(thread.id);
+	await firstStartedPromise;
+	const second = service.cleanupThread(thread.id);
+	finishFirst();
+	const [firstCleanup, secondCleanup] = await Promise.all([first, second]);
+	const store = await readThreadStore(statePath, managerDir);
+	assert.equal(firstCleanup.status, "completed");
+	assert.equal(secondCleanup.status, "completed");
+	assert.equal(cleanupCalls, 1);
+	assert.equal((store.threads[thread.id].worktree as Extract<ThreadWorktree, { mode: "isolated" }>).cleanupState, "removed");
+	assert.equal((store.threads[thread.id].worktree as Extract<ThreadWorktree, { mode: "isolated" }>).cleanedAt, "2026-01-01T00:00:00.000Z");
+	assert.equal((store.threads[thread.id].worktree as Extract<ThreadWorktree, { mode: "isolated" }>).lastError, undefined);
+});
+
+test("cleanup final write does not downgrade worktree already marked removed", async () => {
+	const sourceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "thread-source-"));
+	const executionCwd = path.join(sourceCwd, "..", "source-thread-final-clean");
+	let statePath = "";
+	let managerDir = "";
+	let threadId = "";
+	const worktreeManager: WorktreeManagerPort = {
+		...createFakeWorktreeManager({ sourceCwd, executionCwd }),
+		async cleanupWorktree() {
+			await mutateThreadStore({ statePath, managerDir, now: () => new Date("2026-01-01T00:00:00.000Z") }, (document) => {
+				const worktree = document.threads[threadId].worktree as Extract<ThreadWorktree, { mode: "isolated" }>;
+				worktree.cleanupState = "removed";
+				worktree.cleanedAt = "2026-01-01T00:00:00.000Z";
+				worktree.lastError = undefined;
+			});
+			return { state: "manual_action_required", message: "late stale failure" };
+		},
+	};
+	const serviceContext = await createService({ worktreeManager });
+	({ statePath, managerDir } = serviceContext);
+	const thread = await serviceContext.service.createThread({ cwd: sourceCwd, createdBy: "test" });
+	threadId = thread.id;
+	await serviceContext.service.stopThread(thread.id);
+
+	const cleanup = await serviceContext.service.cleanupThread(thread.id);
+	const store = await readThreadStore(statePath, managerDir);
+	const worktree = store.threads[thread.id].worktree as Extract<ThreadWorktree, { mode: "isolated" }>;
+	assert.equal(cleanup.status, "completed");
+	assert.equal(cleanup.message, "worktree already removed");
+	assert.equal(worktree.cleanupState, "removed");
+	assert.equal(worktree.cleanedAt, "2026-01-01T00:00:00.000Z");
+	assert.equal(worktree.lastError, undefined);
+});
+
+test("cleanup records branch-delete race as manual action after worktree removal", async () => {
+	const sourceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "thread-source-"));
+	const executionCwd = path.join(sourceCwd, "..", "source-thread-branch-race");
+	const { service, statePath, managerDir } = await createService({
+		worktreeManager: createFakeWorktreeManager({
+			sourceCwd,
+			executionCwd,
+			cleanupResult: { state: "manual_action_required", message: "branch thread-manager/thread-1-test changed after cleanup safety check" },
+		}),
+	});
+	const thread = await service.createThread({ cwd: sourceCwd, createdBy: "test" });
+	await service.stopThread(thread.id);
+
+	const cleanup = await service.cleanupThread(thread.id);
+	const store = await readThreadStore(statePath, managerDir);
+	const worktree = store.threads[thread.id].worktree as Extract<ThreadWorktree, { mode: "isolated" }>;
+	assert.equal(cleanup.status, "manual_action_required");
+	assert.equal(cleanup.recoveryAction, "manual");
+	assert.match(cleanup.error ?? "", /changed after cleanup safety check/);
+	assert.equal(worktree.cleanupState, "manual_action_required");
+	assert.equal(worktree.cleanedAt, undefined);
+	assert.match(worktree.lastError ?? "", /changed after cleanup safety check/);
+});
+
+test("restarted service can clean up orphaned isolated thread without live RPC", async () => {
+	const sourceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "thread-source-"));
+	const executionCwd = path.join(sourceCwd, "..", "source-thread-headless-clean");
+	let cleanupCalls = 0;
+	const worktreeManager: WorktreeManagerPort = {
+		...createFakeWorktreeManager({ sourceCwd, executionCwd }),
+		async cleanupWorktree() {
+			cleanupCalls += 1;
+			return { state: "removed", message: "removed", cleanedAt: "2026-01-01T00:00:00.000Z" };
+		},
+	};
+	const { service, statePath, managerDir } = await createService({ worktreeManager });
+	const thread = await service.createThread({ cwd: sourceCwd, createdBy: "test" });
+	await mutateThreadStore({ statePath, managerDir }, (document) => {
+		document.threads[thread.id].status = "orphan_needs_manual_action";
+		document.threads[thread.id].lastError = "daemon restarted";
+	});
+	const restarted = new ThreadService({ statePath, managerDir, randomId: () => "restart", worktreeManager });
+
+	const cleanup = await restarted.cleanupThread(thread.id);
+	const store = await readThreadStore(statePath, managerDir);
+	assert.equal(cleanup.status, "completed");
+	assert.equal(cleanupCalls, 1);
+	assert.equal((store.threads[thread.id].worktree as Extract<ThreadWorktree, { mode: "isolated" }>).cleanupState, "removed");
+});
+
 test("cleanup refuses legacy shared-cwd threads", async () => {
 	const { service, managerDir } = await createService();
 	const thread = await service.createThread({ cwd: managerDir, createdBy: "test", safetyPolicy: sharedSafetyPolicy() });

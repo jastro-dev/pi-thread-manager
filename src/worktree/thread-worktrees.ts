@@ -9,7 +9,7 @@ const WORKTREE_MARKER_FILE = "pi-thread-manager-worktree.json";
 
 export type WorktreeInspection = { ok: true } | { ok: false; reason: string; reservedExists?: boolean };
 export type WorktreeCleanupResult = { state: "removed" | "manual_action_required"; message: string; cleanedAt?: string };
-type BranchCleanupSafety = { safe: true; branchDeleteFlag: "-d" | "-D" } | { safe: false; message: string };
+type BranchCleanupSafety = { safe: true; branchRef: string; expectedOid: string } | { safe: false; message: string };
 
 export interface ProcessInfo {
 	pid: number;
@@ -124,16 +124,18 @@ export class ThreadWorktreeManager {
 		if (!validation.ok) return { state: "manual_action_required", message: validation.reason };
 		const entry = validation.entry;
 		if (!entry) return await this.cleanupMissingWorktree(worktree);
-		const dirty = await git(this.exec, worktree.worktreeRoot, ["status", "--porcelain"]);
-		if (dirty.code !== 0) return { state: "manual_action_required", message: `git status failed in worktree: ${dirty.stderr.trim() || dirty.stdout.trim() || `exit code ${dirty.code}`}` };
-		if (dirty.stdout.trim()) return { state: "manual_action_required", message: "worktree has uncommitted changes; inspect or commit before cleanup" };
+		const status = await git(this.exec, worktree.worktreeRoot, ["status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all"]);
+		if (status.code !== 0) return { state: "manual_action_required", message: `git status failed in worktree: ${status.stderr.trim() || status.stdout.trim() || `exit code ${status.code}`}` };
+		const statusLines = status.stdout.split(/\r?\n/).filter(Boolean);
+		if (statusLines.some((line) => !line.startsWith("!! "))) return { state: "manual_action_required", message: "worktree has uncommitted changes; inspect or commit before cleanup" };
+		if (statusLines.length > 0) return { state: "manual_action_required", message: "worktree has ignored files; inspect or remove before cleanup" };
 		const branchSafety = await this.branchCleanupSafety(worktree.branchName, worktree.primaryRepoRoot);
 		if (!branchSafety.safe) return { state: "manual_action_required", message: branchSafety.message };
 
 		const remove = await git(this.exec, worktree.primaryRepoRoot, ["worktree", "remove", worktree.worktreeRoot]);
 		if (remove.code !== 0) return { state: "manual_action_required", message: `git worktree remove failed: ${remove.stderr.trim() || remove.stdout.trim() || `exit code ${remove.code}`}` };
-		const branchDelete = await git(this.exec, worktree.primaryRepoRoot, ["branch", branchSafety.branchDeleteFlag, worktree.branchName]);
-		if (branchDelete.code !== 0) return { state: "manual_action_required", message: `git branch ${branchSafety.branchDeleteFlag} failed: ${branchDelete.stderr.trim() || branchDelete.stdout.trim() || `exit code ${branchDelete.code}`}` };
+		const branchDelete = await git(this.exec, worktree.primaryRepoRoot, ["update-ref", "-d", branchSafety.branchRef, branchSafety.expectedOid]);
+		if (branchDelete.code !== 0) return { state: "manual_action_required", message: `branch ${worktree.branchName} changed after cleanup safety check or could not be deleted: ${branchDelete.stderr.trim() || branchDelete.stdout.trim() || `exit code ${branchDelete.code}`}` };
 		return { state: "removed", message: `removed worktree ${worktree.worktreeRoot} and branch ${worktree.branchName}`, cleanedAt: this.now().toISOString() };
 	}
 
@@ -165,16 +167,30 @@ export class ThreadWorktreeManager {
 	}
 
 	private async branchCleanupSafety(branchName: string, cwd: string): Promise<BranchCleanupSafety> {
-		if (await this.isBranchMerged(branchName, cwd)) return { safe: true, branchDeleteFlag: "-d" };
 		const branchRef = `refs/heads/${branchName}`;
+		const tip = await git(this.exec, cwd, ["rev-parse", "--verify", `${branchRef}^{commit}`]);
+		if (tip.code !== 0) return { safe: false, message: `branch ${branchName} cannot be resolved: ${tip.stderr.trim() || tip.stdout.trim() || `exit code ${tip.code}`}` };
+		const expectedOid = tip.stdout.trim();
+		if (await this.isBranchMerged(branchRef, cwd)) return { safe: true, branchRef, expectedOid };
+		const refresh = await this.refreshRemoteTrackingBranches(cwd);
+		if (!refresh.ok) return { safe: false, message: refresh.message };
 		const unreachableFromRemotes = await git(this.exec, cwd, ["log", "--format=%H", branchRef, "--not", "--remotes", "--"]);
 		if (unreachableFromRemotes.code !== 0) return { safe: false, message: `branch ${branchName} is not merged into HEAD and remote reachability check failed: ${unreachableFromRemotes.stderr.trim() || unreachableFromRemotes.stdout.trim() || `exit code ${unreachableFromRemotes.code}`}` };
-		if (!unreachableFromRemotes.stdout.trim()) return { safe: true, branchDeleteFlag: "-D" };
+		if (!unreachableFromRemotes.stdout.trim()) return { safe: true, branchRef, expectedOid };
 		return { safe: false, message: `branch ${branchName} has commits not merged into HEAD or reachable from any remote-tracking branch; cleanup refused` };
 	}
 
-	private async isBranchMerged(branchName: string, cwd: string): Promise<boolean> {
-		const result = await git(this.exec, cwd, ["merge-base", "--is-ancestor", `refs/heads/${branchName}`, "HEAD"]);
+	private async refreshRemoteTrackingBranches(cwd: string): Promise<{ ok: true } | { ok: false; message: string }> {
+		const remotes = await git(this.exec, cwd, ["remote"]);
+		if (remotes.code !== 0) return { ok: false, message: `remote reachability check failed before fetch: ${remotes.stderr.trim() || remotes.stdout.trim() || `exit code ${remotes.code}`}` };
+		if (!remotes.stdout.trim()) return { ok: false, message: "branch is not merged into HEAD or reachable from any remote-tracking branch; no remotes configured for refreshed proof" };
+		const fetch = await git(this.exec, cwd, ["fetch", "--all", "--prune"]);
+		if (fetch.code !== 0) return { ok: false, message: `remote reachability check failed while refreshing remote-tracking branches: ${fetch.stderr.trim() || fetch.stdout.trim() || `exit code ${fetch.code}`}` };
+		return { ok: true };
+	}
+
+	private async isBranchMerged(branchRef: string, cwd: string): Promise<boolean> {
+		const result = await git(this.exec, cwd, ["merge-base", "--is-ancestor", branchRef, "HEAD"]);
 		return result.code === 0;
 	}
 
