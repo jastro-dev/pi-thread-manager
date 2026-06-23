@@ -69,6 +69,10 @@ test("cleanup removes locally unmerged branch reachable from fork remote-trackin
 	await gitOk(repo, ["remote", "add", "fork", fork]);
 	await gitOk(repo, ["push", "fork", `${allocated.branchName}:refs/heads/${allocated.branchName}`]);
 	await gitOk(repo, ["fetch", "fork"]);
+	await fs.mkdir(path.dirname(path.join(repo, allocated.branchName)), { recursive: true });
+	await fs.writeFile(path.join(repo, allocated.branchName), "path collides with branch name\n", "utf8");
+	await gitOk(repo, ["add", allocated.branchName]);
+	await gitOk(repo, ["commit", "-m", "add branch name path"]);
 
 	const result = await manager.cleanupWorktree(allocated);
 	assert.equal(result.state, "removed");

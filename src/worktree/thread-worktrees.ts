@@ -166,14 +166,15 @@ export class ThreadWorktreeManager {
 
 	private async branchCleanupSafety(branchName: string, cwd: string): Promise<BranchCleanupSafety> {
 		if (await this.isBranchMerged(branchName, cwd)) return { safe: true, branchDeleteFlag: "-d" };
-		const unreachableFromRemotes = await git(this.exec, cwd, ["log", "--format=%H", branchName, "--not", "--remotes"]);
+		const branchRef = `refs/heads/${branchName}`;
+		const unreachableFromRemotes = await git(this.exec, cwd, ["log", "--format=%H", branchRef, "--not", "--remotes", "--"]);
 		if (unreachableFromRemotes.code !== 0) return { safe: false, message: `branch ${branchName} is not merged into HEAD and remote reachability check failed: ${unreachableFromRemotes.stderr.trim() || unreachableFromRemotes.stdout.trim() || `exit code ${unreachableFromRemotes.code}`}` };
 		if (!unreachableFromRemotes.stdout.trim()) return { safe: true, branchDeleteFlag: "-D" };
 		return { safe: false, message: `branch ${branchName} has commits not merged into HEAD or reachable from any remote-tracking branch; cleanup refused` };
 	}
 
 	private async isBranchMerged(branchName: string, cwd: string): Promise<boolean> {
-		const result = await git(this.exec, cwd, ["merge-base", "--is-ancestor", branchName, "HEAD"]);
+		const result = await git(this.exec, cwd, ["merge-base", "--is-ancestor", `refs/heads/${branchName}`, "HEAD"]);
 		return result.code === 0;
 	}
 
