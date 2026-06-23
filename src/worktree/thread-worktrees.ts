@@ -9,6 +9,7 @@ const WORKTREE_MARKER_FILE = "pi-thread-manager-worktree.json";
 
 export type WorktreeInspection = { ok: true } | { ok: false; reason: string; reservedExists?: boolean };
 export type WorktreeCleanupResult = { state: "removed" | "manual_action_required"; message: string; cleanedAt?: string };
+type BranchCleanupSafety = { safe: true; branchDeleteFlag: "-d" | "-D" } | { safe: false; message: string };
 
 export interface ProcessInfo {
 	pid: number;
@@ -126,12 +127,13 @@ export class ThreadWorktreeManager {
 		const dirty = await git(this.exec, worktree.worktreeRoot, ["status", "--porcelain"]);
 		if (dirty.code !== 0) return { state: "manual_action_required", message: `git status failed in worktree: ${dirty.stderr.trim() || dirty.stdout.trim() || `exit code ${dirty.code}`}` };
 		if (dirty.stdout.trim()) return { state: "manual_action_required", message: "worktree has uncommitted changes; inspect or commit before cleanup" };
-		if (!(await this.isBranchMerged(worktree.branchName, worktree.primaryRepoRoot))) return { state: "manual_action_required", message: `branch ${worktree.branchName} is not merged; cleanup refused` };
+		const branchSafety = await this.branchCleanupSafety(worktree.branchName, worktree.primaryRepoRoot);
+		if (!branchSafety.safe) return { state: "manual_action_required", message: branchSafety.message };
 
 		const remove = await git(this.exec, worktree.primaryRepoRoot, ["worktree", "remove", worktree.worktreeRoot]);
 		if (remove.code !== 0) return { state: "manual_action_required", message: `git worktree remove failed: ${remove.stderr.trim() || remove.stdout.trim() || `exit code ${remove.code}`}` };
-		const branchDelete = await git(this.exec, worktree.primaryRepoRoot, ["branch", "-d", worktree.branchName]);
-		if (branchDelete.code !== 0) return { state: "manual_action_required", message: `git branch -d failed: ${branchDelete.stderr.trim() || branchDelete.stdout.trim() || `exit code ${branchDelete.code}`}` };
+		const branchDelete = await git(this.exec, worktree.primaryRepoRoot, ["branch", branchSafety.branchDeleteFlag, worktree.branchName]);
+		if (branchDelete.code !== 0) return { state: "manual_action_required", message: `git branch ${branchSafety.branchDeleteFlag} failed: ${branchDelete.stderr.trim() || branchDelete.stdout.trim() || `exit code ${branchDelete.code}`}` };
 		return { state: "removed", message: `removed worktree ${worktree.worktreeRoot} and branch ${worktree.branchName}`, cleanedAt: this.now().toISOString() };
 	}
 
@@ -160,6 +162,14 @@ export class ThreadWorktreeManager {
 	private async existingBranches(cwd: string): Promise<Set<string>> {
 		const stdout = await requireGit(this.exec, cwd, ["branch", "--format=%(refname:short)"], "git branch");
 		return new Set(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+	}
+
+	private async branchCleanupSafety(branchName: string, cwd: string): Promise<BranchCleanupSafety> {
+		if (await this.isBranchMerged(branchName, cwd)) return { safe: true, branchDeleteFlag: "-d" };
+		const unreachableFromRemotes = await git(this.exec, cwd, ["log", "--format=%H", branchName, "--not", "--remotes"]);
+		if (unreachableFromRemotes.code !== 0) return { safe: false, message: `branch ${branchName} is not merged into HEAD and remote reachability check failed: ${unreachableFromRemotes.stderr.trim() || unreachableFromRemotes.stdout.trim() || `exit code ${unreachableFromRemotes.code}`}` };
+		if (!unreachableFromRemotes.stdout.trim()) return { safe: true, branchDeleteFlag: "-D" };
+		return { safe: false, message: `branch ${branchName} has commits not merged into HEAD or reachable from any remote-tracking branch; cleanup refused` };
 	}
 
 	private async isBranchMerged(branchName: string, cwd: string): Promise<boolean> {

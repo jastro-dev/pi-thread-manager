@@ -48,7 +48,7 @@ test("rejects non-git, dirty source, detached source without baseRef, and invali
 	await assert.rejects(() => manager.prepareAllocation(detached, { threadId: "thread-1", baseRef: "missing-ref" }), /rev-parse/);
 });
 
-test("cleanup removes clean allocated worktree and branch", async () => {
+test("cleanup removes clean allocated worktree and branch when merged into HEAD", async () => {
 	const repo = await createGitRepo();
 	const manager = new ThreadWorktreeManager({ processInspector: async () => [] });
 	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-clean", name: "cleanup" }));
@@ -56,6 +56,40 @@ test("cleanup removes clean allocated worktree and branch", async () => {
 	assert.equal(result.state, "removed");
 	assert.equal(await exists(allocated.worktreeRoot), false);
 	assert.notEqual((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
+});
+
+test("cleanup removes locally unmerged branch reachable from fork remote-tracking branch", async () => {
+	const repo = await createGitRepo();
+	const fork = await createBareGitRepo();
+	const manager = new ThreadWorktreeManager({ processInspector: async () => [] });
+	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-remote", name: "cleanup" }));
+	await fs.writeFile(path.join(allocated.worktreeRoot, "remote.txt"), "remote-backed\n", "utf8");
+	await gitOk(allocated.worktreeRoot, ["add", "remote.txt"]);
+	await gitOk(allocated.worktreeRoot, ["commit", "-m", "remote backed"]);
+	await gitOk(repo, ["remote", "add", "fork", fork]);
+	await gitOk(repo, ["push", "fork", `${allocated.branchName}:refs/heads/${allocated.branchName}`]);
+	await gitOk(repo, ["fetch", "fork"]);
+
+	const result = await manager.cleanupWorktree(allocated);
+	assert.equal(result.state, "removed");
+	assert.equal(await exists(allocated.worktreeRoot), false);
+	assert.notEqual((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/remotes/fork/${allocated.branchName}`])).code, 0);
+});
+
+test("cleanup refuses locally unmerged branch with commits unreachable from remotes", async () => {
+	const repo = await createGitRepo();
+	const manager = new ThreadWorktreeManager({ processInspector: async () => [] });
+	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-unpushed", name: "cleanup" }));
+	await fs.writeFile(path.join(allocated.worktreeRoot, "unpushed.txt"), "unpushed\n", "utf8");
+	await gitOk(allocated.worktreeRoot, ["add", "unpushed.txt"]);
+	await gitOk(allocated.worktreeRoot, ["commit", "-m", "unpushed"]);
+
+	const result = await manager.cleanupWorktree(allocated);
+	assert.equal(result.state, "manual_action_required");
+	assert.match(result.message, /not merged into HEAD or reachable from any remote-tracking branch/);
+	assert.equal(await exists(allocated.worktreeRoot), true);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
 });
 
 test("cleanup refuses dirty worktrees", async () => {
@@ -116,6 +150,12 @@ async function createGitRepo(): Promise<string> {
 	await fs.writeFile(path.join(repo, "src", "file.txt"), "hello\n", "utf8");
 	await gitOk(repo, ["add", "."]);
 	await gitOk(repo, ["commit", "-m", "initial"]);
+	return await fs.realpath(repo);
+}
+
+async function createBareGitRepo(): Promise<string> {
+	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "thread-git-remote-"));
+	await gitOk(repo, ["init", "--bare"]);
 	return await fs.realpath(repo);
 }
 
