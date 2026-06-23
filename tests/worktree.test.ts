@@ -81,6 +81,26 @@ test("cleanup removes locally unmerged branch reachable from fork remote-trackin
 	assert.equal((await git(repo, ["show-ref", "--verify", `refs/remotes/fork/${allocated.branchName}`])).code, 0);
 });
 
+test("cleanup refreshes remotes before accepting a remote-backed branch", async () => {
+	const repo = await createGitRepo();
+	const fork = await createBareGitRepo();
+	const manager = new ThreadWorktreeManager({ processInspector: async () => [] });
+	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-refreshes-remote", name: "cleanup" }));
+	await fs.writeFile(path.join(allocated.worktreeRoot, "remote.txt"), "remote-backed\n", "utf8");
+	await gitOk(allocated.worktreeRoot, ["add", "remote.txt"]);
+	await gitOk(allocated.worktreeRoot, ["commit", "-m", "remote backed"]);
+	await gitOk(repo, ["remote", "add", "fork", fork]);
+	await gitOk(repo, ["push", "fork", `${allocated.branchName}:refs/heads/${allocated.branchName}`]);
+	await git(repo, ["update-ref", "-d", `refs/remotes/fork/${allocated.branchName}`]);
+	assert.notEqual((await git(repo, ["show-ref", "--verify", `refs/remotes/fork/${allocated.branchName}`])).code, 0);
+
+	const result = await manager.cleanupWorktree(allocated);
+	assert.equal(result.state, "removed");
+	assert.equal(await exists(allocated.worktreeRoot), false);
+	assert.notEqual((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/remotes/fork/${allocated.branchName}`])).code, 0);
+});
+
 test("cleanup refuses locally unmerged branch when only a stale remote-tracking ref contains it", async () => {
 	const repo = await createGitRepo();
 	const fork = await createBareGitRepo();
@@ -182,6 +202,24 @@ test("cleanup refuses dirty worktrees", async () => {
 	assert.equal(result.state, "manual_action_required");
 	assert.match(result.message, /uncommitted changes/);
 	assert.equal(await exists(allocated.worktreeRoot), true);
+});
+
+test("cleanup refuses ignored files before removing worktree", async () => {
+	const repo = await createGitRepo();
+	await fs.writeFile(path.join(repo, ".gitignore"), "secret.env\n", "utf8");
+	await gitOk(repo, ["add", ".gitignore"]);
+	await gitOk(repo, ["commit", "-m", "ignore local secrets"]);
+	const manager = new ThreadWorktreeManager({ processInspector: async () => [] });
+	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-ignored", name: "cleanup" }));
+	const ignoredPath = path.join(allocated.worktreeRoot, "secret.env");
+	await fs.writeFile(ignoredPath, "do not delete\n", "utf8");
+
+	const result = await manager.cleanupWorktree(allocated);
+	assert.equal(result.state, "manual_action_required");
+	assert.match(result.message, /ignored files/);
+	assert.equal(await exists(allocated.worktreeRoot), true);
+	assert.equal(await exists(ignoredPath), true);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
 });
 
 test("cleanup refuses non-manager-owned worktree metadata", async () => {

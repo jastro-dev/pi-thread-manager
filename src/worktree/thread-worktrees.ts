@@ -124,9 +124,11 @@ export class ThreadWorktreeManager {
 		if (!validation.ok) return { state: "manual_action_required", message: validation.reason };
 		const entry = validation.entry;
 		if (!entry) return await this.cleanupMissingWorktree(worktree);
-		const dirty = await git(this.exec, worktree.worktreeRoot, ["status", "--porcelain"]);
-		if (dirty.code !== 0) return { state: "manual_action_required", message: `git status failed in worktree: ${dirty.stderr.trim() || dirty.stdout.trim() || `exit code ${dirty.code}`}` };
-		if (dirty.stdout.trim()) return { state: "manual_action_required", message: "worktree has uncommitted changes; inspect or commit before cleanup" };
+		const status = await git(this.exec, worktree.worktreeRoot, ["status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all"]);
+		if (status.code !== 0) return { state: "manual_action_required", message: `git status failed in worktree: ${status.stderr.trim() || status.stdout.trim() || `exit code ${status.code}`}` };
+		const statusLines = status.stdout.split(/\r?\n/).filter(Boolean);
+		if (statusLines.some((line) => !line.startsWith("!! "))) return { state: "manual_action_required", message: "worktree has uncommitted changes; inspect or commit before cleanup" };
+		if (statusLines.length > 0) return { state: "manual_action_required", message: "worktree has ignored files; inspect or remove before cleanup" };
 		const branchSafety = await this.branchCleanupSafety(worktree.branchName, worktree.primaryRepoRoot);
 		if (!branchSafety.safe) return { state: "manual_action_required", message: branchSafety.message };
 
