@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export interface ReviewThreadComment {
 	id: string;
 	body: string;
@@ -100,4 +102,40 @@ export async function runReviewLoopOnce(input: {
 		});
 	}
 	return recommendation;
+}
+
+export function mergeReviewThreadClusters(clusters: ReviewThreadCluster[]): ReviewThreadCluster {
+	const allThreads = clusters.flatMap((cluster) => cluster.threads);
+	return {
+		key: clusters.map((cluster) => cluster.key).join(","),
+		path: clusters.length === 1 ? clusters[0].path : null,
+		threadIds: clusters.flatMap((cluster) => cluster.threadIds),
+		threads: allThreads,
+	};
+}
+
+export function reviewLoopSnapshotKey(action: ReviewLoopAction): string | undefined {
+	if (action.action !== "process_review_comment") return undefined;
+	const revisions = action.clusters.flatMap((cluster) => cluster.threads.map((thread) => ({
+		id: thread.id,
+		comments: thread.comments.map((comment) => ({ id: comment.id, body: comment.body, updatedAt: comment.updatedAt, createdAt: comment.createdAt })),
+	})));
+	return createHash("sha256").update(JSON.stringify(revisions)).digest("hex");
+}
+
+export function reviewLoopTerminalReason(action: Exclude<ReviewLoopAction["action"], "process_review_comment">, snapshot: ReviewSnapshot): string {
+	switch (action) {
+		case "ready_to_merge":
+			return `no actionable review threads for ${snapshot.repo}#${snapshot.prNumber}`;
+		case "diagnose_ci_failure":
+			return `CI is blocking ${snapshot.repo}#${snapshot.prNumber}`;
+		case "stop_pr_closed":
+			return `PR ${snapshot.repo}#${snapshot.prNumber} is ${snapshot.state}`;
+		case "idle":
+			return `review loop idle for ${snapshot.repo}#${snapshot.prNumber}`;
+		default: {
+			const exhaustive: never = action;
+			return exhaustive;
+		}
+	}
 }

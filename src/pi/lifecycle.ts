@@ -1,15 +1,12 @@
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { readdir, realpath, stat } from "node:fs/promises";
-import { createInterface } from "node:readline/promises";
+import { randomUUID } from "node:crypto";
 
 import { getThreadManagerDir, getThreadStorePath } from "../broker/paths.ts";
 import { authorizeSecret } from "../broker/auth.ts";
 import type { BrokerRequestContext, BrokerRequestHandler } from "../broker/broker.ts";
 import { DuplicateJobSnapshotError, ThreadScheduler } from "../automation/scheduler.ts";
 import { fetchGithubReviewThreads } from "../automation/github-review-threads.ts";
-import { buildFixerPrompt, recommendReviewLoopAction, type GithubReviewPort, type ReviewSnapshot, type ReviewThreadCluster } from "../automation/review-loop.ts";
+import { buildFixerPrompt, mergeReviewThreadClusters, recommendReviewLoopAction, reviewLoopSnapshotKey, reviewLoopTerminalReason, type GithubReviewPort } from "../automation/review-loop.ts";
 import {
 	isCommandAllowed,
 	normalizeLaunchProfile,
@@ -25,11 +22,38 @@ import {
 } from "../protocol.ts";
 import { acquireFileLock } from "../store/lock.ts";
 import { mutateThreadStore, readThreadStore, readThreadStoreSafe } from "../store/thread-store.ts";
-import { DEFAULT_PROTOCOL_LIMITS, PROTOCOL_VERSION, type CreateThreadInput, type DaemonStatus, type JobLease, type ManagedThread, type ThreadAction, type ThreadOperation, type ThreadReadResult, type ThreadStoreDocument, type ThreadWorktree } from "../types.ts";
+import { DEFAULT_PROTOCOL_LIMITS, type CreateThreadInput, type DaemonStatus, type JobLease, type ManagedThread, type ThreadAction, type ThreadOperation, type ThreadReadResult, type ThreadStoreDocument, type ThreadWorktree } from "../types.ts";
 import { ThreadWorktreeManager, type WorktreeCleanupResult, type WorktreeInspection } from "../worktree/thread-worktrees.ts";
 import { ensureThreadPathsForManager } from "./session-files.ts";
 import { launchPiRpcThread, type LaunchedThreadProcess } from "./launcher.ts";
+import { discoverSessionFile, readSessionTranscript, realpathCwd, type TranscriptWindow } from "./session-transcript.ts";
+import {
+	applyCreateFailed,
+	applyStopKillFailed,
+	applyThreadCrashedAfterReadFailure,
+	applyThreadStatus,
+	applyThreadStopped,
+	applyUnknownAfterMissingHandle,
+	authorizationCwd,
+	cancelNonTerminalThreadOperations,
+	cloneManagedThread,
+	createOperation,
+	describeChildUiRequest,
+	DuplicateOperationError,
+	getRestartDecision,
+	GLOBAL_APPROVAL_SCOPE_THREAD_ID,
+	isPassiveChildUiRequest,
+	isTerminalOperation,
+	markCreatingThreadFailedAfterRestart,
+	markThreadOrphanAfterRestart,
+	requireDeliveredOperation,
+	requireThread,
+	summarizeStore,
+	waitForChildExit,
+} from "./thread-transitions.ts";
 import type { PiRpcCommand, PiRpcUiRequest } from "./rpc-client.ts";
+
+export { isPassiveChildUiRequest, summarizeStore } from "./thread-transitions.ts";
 
 const STARTUP_STATE_TIMEOUT_MS = 30_000;
 
@@ -290,29 +314,12 @@ export class ThreadService implements BrokerRequestHandler {
 		}
 	}
 
+	private async mutate<T>(mutator: (document: ThreadStoreDocument) => T | Promise<T>): Promise<T> {
+		return await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, mutator);
+	}
+
 	private async markCreateFailed(threadId: string, operationId: string, error: unknown, cleanup?: WorktreeCleanupResult): Promise<void> {
-		await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-			const thread = document.threads[threadId];
-			if (!thread) return;
-			const message = error instanceof Error ? error.message : String(error);
-			thread.status = "failed";
-			thread.lastError = message;
-			thread.updatedAt = this.now().toISOString();
-			thread.currentOperationId = undefined;
-			if (thread.worktree?.mode === "isolated" && cleanup) {
-				thread.worktree.cleanupState = cleanup.state;
-				thread.worktree.lastError = cleanup.message;
-				thread.worktree.cleanedAt = cleanup.cleanedAt;
-				if (thread.worktree.allocationState === "reserved") thread.worktree.allocationState = cleanup.state === "removed" ? "allocation_failed" : "allocated";
-			}
-			const operation = document.operations[operationId];
-			if (operation) {
-				operation.status = "failed";
-				operation.error = message;
-				operation.message = cleanup?.message;
-				operation.updatedAt = this.now().toISOString();
-			}
-		});
+		await this.mutate((document) => applyCreateFailed(document, threadId, operationId, error, this.now, cleanup));
 	}
 
 	async readThread(threadId: string, cursor = 0, limit = 50): Promise<ThreadReadResult> {
@@ -404,50 +411,6 @@ export class ThreadService implements BrokerRequestHandler {
 				return (await readThreadStore(this.statePath, this.managerDir)).operations[operationId];
 			} catch (error) {
 				await this.markCommandRejected(threadId, operationId, error, handle);
-				throw error;
-			}
-		});
-	}
-
-	private async queueReviewLoopFollowUp(threadId: string, message: string, requestId: string): Promise<ThreadOperation> {
-		const operationId = `op-${this.randomId()}`;
-		const now = this.now().toISOString();
-		try {
-			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-				const thread = requireThread(document, threadId);
-				const existing = Object.values(document.operations).find((operation) => operation.threadId === threadId && operation.requestId === requestId);
-				if (existing) throw new DuplicateOperationError(existing.id);
-				if (thread.status !== "running") throw new Error(`review_loop follow-up requires running thread; current status is ${thread.status}`);
-				const queued = Object.values(document.operations).filter((operation) => operation.threadId === threadId && operation.kind === "follow_up" && !isTerminalOperation(operation.status)).length;
-				if (queued >= DEFAULT_PROTOCOL_LIMITS.maxQueueDepth) throw new Error(`follow_up queue limit reached (${DEFAULT_PROTOCOL_LIMITS.maxQueueDepth})`);
-				document.operations[operationId] = createOperation(operationId, "follow_up", threadId, now, message, requestId);
-				thread.lastActivityAt = now;
-				thread.updatedAt = now;
-			});
-		} catch (error) {
-			if (error instanceof DuplicateOperationError) return await this.requireDeliveredDuplicate(error.operationId);
-			throw error;
-		}
-		return await this.withThreadCommandLock(threadId, async () => {
-			await this.assertOperationStillOwnsThread(threadId, operationId, "follow_up");
-			const handle = this.handles.get(threadId);
-			if (!handle) {
-				await this.markUnknownAfterMissingHandle(threadId, operationId);
-				throw new Error(`Thread ${threadId} has no live RPC handle; manual reconciliation required`);
-			}
-			try {
-				await handle.rpc.request({ type: "follow_up", message });
-				await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-					document.operations[operationId].status = "acknowledged";
-					document.operations[operationId].updatedAt = this.now().toISOString();
-				});
-				return (await readThreadStore(this.statePath, this.managerDir)).operations[operationId];
-			} catch (error) {
-				await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-					document.operations[operationId].status = "failed";
-					document.operations[operationId].error = error instanceof Error ? error.message : String(error);
-					document.operations[operationId].updatedAt = this.now().toISOString();
-				});
 				throw error;
 			}
 		});
@@ -1164,245 +1127,4 @@ export class ThreadService implements BrokerRequestHandler {
 
 export function createThreadService(deps: ThreadServiceDeps = {}): ThreadService {
 	return new ThreadService(deps);
-}
-
-export function reviewLoopTerminalReason(action: Exclude<ReturnType<typeof recommendReviewLoopAction>["action"], "process_review_comment">, snapshot: ReviewSnapshot): string {
-	switch (action) {
-		case "ready_to_merge":
-			return `no actionable review threads for ${snapshot.repo}#${snapshot.prNumber}`;
-		case "diagnose_ci_failure":
-			return `CI is blocking ${snapshot.repo}#${snapshot.prNumber}`;
-		case "stop_pr_closed":
-			return `PR ${snapshot.repo}#${snapshot.prNumber} is ${snapshot.state}`;
-		case "idle":
-			return `review loop idle for ${snapshot.repo}#${snapshot.prNumber}`;
-		default: {
-			const exhaustive: never = action;
-			return exhaustive;
-		}
-	}
-}
-
-export function summarizeStore(document: ThreadStoreDocument, storePath: string, daemonEpoch: string): DaemonStatus {
-	const threads = Object.values(document.threads);
-	return {
-		protocolVersion: PROTOCOL_VERSION,
-		daemonPid: process.pid,
-		daemonEpoch,
-		storePath,
-		threadCount: threads.length,
-		activeThreadCount: threads.filter((thread) => ["creating", "starting", "idle", "running", "stopping"].includes(thread.status)).length,
-		orphanThreadCount: threads.filter((thread) => thread.status === "orphan_needs_manual_action").length,
-		isolatedThreadCount: threads.filter((thread) => thread.worktree?.mode === "isolated").length,
-		legacySharedCwdThreadCount: threads.filter((thread) => thread.worktree?.mode === "legacy_shared_cwd").length,
-		cleanupPendingWorktreeCount: threads.filter((thread) => thread.worktree?.mode === "isolated" && thread.worktree.cleanupState === "cleanup_pending").length,
-		worktreeManualActionCount: threads.filter((thread) => thread.worktree?.mode === "isolated" && thread.worktree.cleanupState === "manual_action_required").length,
-		pendingOperationCount: Object.values(document.operations).filter((operation) => ["intent_recorded", "external_action_attempted", "acknowledged", "running", "approval_required", "unknown_after_restart", "manual_action_required"].includes(operation.status)).length,
-		pendingApprovalCount: Object.values(document.approvals).filter((approval) => approval.status === "pending").length,
-		activeScheduleCount: Object.values(document.schedules).filter((schedule) => schedule.status === "scheduled" || schedule.status === "running").length,
-		pausedReason: document.pausedReason,
-	};
-}
-
-async function realpathCwd(cwd: string): Promise<string> {
-	return await realpath(path.resolve(cwd));
-}
-
-interface TranscriptWindow {
-	items: unknown[];
-	truncated: boolean;
-}
-
-async function readSessionTranscript(sessionFile: string, cursor: number, limit: number): Promise<TranscriptWindow> {
-	const items: unknown[] = [];
-	let lineIndex = 0;
-	let truncated = false;
-	let sawLine = false;
-	const stream = createReadStream(sessionFile, { encoding: "utf8" });
-	const reader = createInterface({ input: stream, crlfDelay: Infinity });
-	try {
-		for await (const line of reader) {
-			if (line.trim() === "") continue;
-			sawLine = true;
-			if (lineIndex >= cursor) {
-				if (items.length >= limit) {
-					truncated = true;
-					break;
-				}
-				items.push(parseTranscriptLine(line));
-			}
-			lineIndex += 1;
-		}
-		if (!sawLine && cursor === 0) items.push({ type: "thread_manager_unavailable", message: "Persisted session transcript is empty" });
-		return { items, truncated };
-	} catch (error) {
-		return { items: [{ type: "thread_manager_unavailable", message: `Could not read persisted session transcript: ${error instanceof Error ? error.message : String(error)}` }], truncated: false };
-	} finally {
-		reader.close();
-		stream.destroy();
-	}
-}
-
-async function discoverSessionFile(sessionDir: string, fallback: string | undefined): Promise<string | undefined> {
-	let entries: string[];
-	try {
-		entries = await readdir(sessionDir);
-	} catch {
-		return fallback;
-	}
-	let newest: { filePath: string; mtimeMs: number } | undefined;
-	for (const entry of entries) {
-		if (!entry.endsWith(".jsonl")) continue;
-		const filePath = path.join(sessionDir, entry);
-		try {
-			const info = await stat(filePath);
-			if (!info.isFile()) continue;
-			if (!newest || info.mtimeMs > newest.mtimeMs) newest = { filePath, mtimeMs: info.mtimeMs };
-		} catch {}
-	}
-	return newest?.filePath ?? fallback;
-}
-
-function cancelNonTerminalThreadOperations(document: ThreadStoreDocument, threadId: string, exceptOperationId: string, error: string, updatedAt: string): void {
-	for (const operation of Object.values(document.operations)) {
-		if (operation.id === exceptOperationId || operation.threadId !== threadId || isTerminalOperation(operation.status)) continue;
-		operation.status = "cancelled";
-		operation.error = error;
-		operation.updatedAt = updatedAt;
-	}
-}
-
-function mergeReviewThreadClusters(clusters: ReviewThreadCluster[]): ReviewThreadCluster {
-	const allThreads = clusters.flatMap((cluster) => cluster.threads);
-	return {
-		key: clusters.map((cluster) => cluster.key).join(","),
-		path: clusters.length === 1 ? clusters[0].path : null,
-		threadIds: clusters.flatMap((cluster) => cluster.threadIds),
-		threads: allThreads,
-	};
-}
-
-function cloneManagedThread(thread: ManagedThread): ManagedThread {
-	return {
-		...thread,
-		tags: [...thread.tags],
-		launchProfile: { ...thread.launchProfile },
-		safetyPolicy: { ...thread.safetyPolicy, restartPolicy: { ...thread.safetyPolicy.restartPolicy } },
-		worktree: thread.worktree ? { ...thread.worktree } : undefined,
-	};
-}
-
-function parseTranscriptLine(line: string): unknown {
-	try {
-		return JSON.parse(line) as unknown;
-	} catch {
-		return { type: "session_line", text: line };
-	}
-}
-
-function createOperation(id: string, kind: ThreadOperation["kind"], threadId: string, now: string, message?: string, requestId?: string): ThreadOperation {
-	return {
-		id,
-		kind,
-		status: "intent_recorded",
-		threadId,
-		requestId,
-		idempotencyKey: requestId ? `${kind}:${threadId}:${requestId}` : `${kind}:${threadId}:${id}`,
-		createdAt: now,
-		updatedAt: now,
-		message,
-	};
-}
-
-function isTerminalOperation(status: ThreadOperation["status"]): boolean {
-	return ["cancelled", "completed", "failed", "reconciled", "manual_action_required"].includes(status);
-}
-
-function requireDeliveredOperation(operation: ThreadOperation | undefined): ThreadOperation {
-	if (!operation) throw new Error("duplicate operation not found");
-	if (operation.status === "acknowledged" || operation.status === "completed" || operation.status === "reconciled") return operation;
-	throw new Error(`duplicate operation ${operation.id} is ${operation.status}, not delivered`);
-}
-
-class DuplicateOperationError extends Error {
-	constructor(readonly operationId: string) {
-		super(`duplicate operation ${operationId}`);
-	}
-}
-
-const GLOBAL_APPROVAL_SCOPE_THREAD_ID = "thread-manager-global-approval-scope";
-
-async function waitForChildExit(child: { once(event: "exit", listener: () => void): unknown; exitCode: number | null }, timeoutMs: number): Promise<boolean> {
-	if (child.exitCode !== null) return true;
-	return await new Promise((resolve) => {
-		const timer = setTimeout(() => resolve(false), timeoutMs);
-		child.once("exit", () => {
-			clearTimeout(timer);
-			resolve(true);
-		});
-	});
-}
-
-function requireThread(document: ThreadStoreDocument, threadId: string): ManagedThread {
-	const thread = document.threads[threadId];
-	if (!thread) throw new Error(`Thread not found: ${threadId}`);
-	return thread;
-}
-
-function authorizationCwd(thread: ManagedThread | undefined): string | undefined {
-	return thread?.worktree?.sourceCwd ?? thread?.cwd;
-}
-
-function getRestartDecision(thread: ManagedThread, now: Date): { allowed: true } | { allowed: false; reason: string; retryAfter?: string } {
-	const policy = thread.safetyPolicy.restartPolicy;
-	if (policy.mode !== "from_session") return { allowed: false, reason: "Daemon restarted without a reconnectable child RPC control channel" };
-	if (thread.currentOperationId) return { allowed: false, reason: "Daemon restarted while operation outcome is unknown" };
-	if ((thread.restartCount ?? 0) >= policy.maxRestarts) return { allowed: false, reason: "Restart policy maxRestarts exhausted" };
-	if (thread.restartBackoffUntil && new Date(thread.restartBackoffUntil).getTime() > now.getTime()) {
-		return { allowed: false, reason: `Restart policy backoff active until ${thread.restartBackoffUntil}`, retryAfter: thread.restartBackoffUntil };
-	}
-	return { allowed: true };
-}
-
-function reviewLoopSnapshotKey(action: ReturnType<typeof recommendReviewLoopAction>): string | undefined {
-	if (action.action !== "process_review_comment") return undefined;
-	const revisions = action.clusters.flatMap((cluster) => cluster.threads.map((thread) => ({
-		id: thread.id,
-		comments: thread.comments.map((comment) => ({ id: comment.id, body: comment.body, updatedAt: comment.updatedAt, createdAt: comment.createdAt })),
-	})));
-	return createHash("sha256").update(JSON.stringify(revisions)).digest("hex");
-}
-
-export function isPassiveChildUiRequest(request: PiRpcUiRequest): boolean {
-	return ["notify", "setStatus", "setTitle", "setWidget"].includes(describeChildUiRequest(request));
-}
-
-function describeChildUiRequest(request: PiRpcUiRequest): string {
-	const label = request.method ?? request.kind ?? request.requestType ?? request.name ?? request.id;
-	return typeof label === "string" ? label : request.id;
-}
-
-function markThreadOrphanAfterRestart(document: ThreadStoreDocument, thread: ManagedThread, now: string, reason = "Daemon restarted without a reconnectable child RPC control channel"): void {
-	thread.status = "orphan_needs_manual_action";
-	if (thread.currentOperationId && document.operations[thread.currentOperationId]) {
-		document.operations[thread.currentOperationId].status = "unknown_after_restart";
-		document.operations[thread.currentOperationId].recoveryAction = "manual";
-		document.operations[thread.currentOperationId].error = reason;
-		document.operations[thread.currentOperationId].updatedAt = now;
-	}
-	thread.currentOperationId = undefined;
-	thread.lastError = reason;
-	thread.updatedAt = now;
-}
-
-function markCreatingThreadFailedAfterRestart(document: ThreadStoreDocument, thread: ManagedThread, now: string, reason = "Daemon restarted before thread launch completed"): void {
-	thread.status = "failed";
-	thread.lastError = reason;
-	thread.updatedAt = now;
-	if (thread.currentOperationId && document.operations[thread.currentOperationId]) {
-		document.operations[thread.currentOperationId].status = "failed";
-		document.operations[thread.currentOperationId].error = reason;
-		document.operations[thread.currentOperationId].updatedAt = now;
-	}
-	thread.currentOperationId = undefined;
 }
