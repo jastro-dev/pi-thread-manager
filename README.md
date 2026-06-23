@@ -88,7 +88,7 @@ Shared-cwd threads still work when explicitly requested:
 
 Use shared cwd for read-only scouting or when you deliberately want the child Pi session in the parent cwd. Avoid concurrent writers in shared cwd.
 
-`stop` only stops the process. It keeps isolated worktrees intact. Use `/threads cleanup <thread-id>` after inspecting the result. Cleanup refuses dirty, locked, occupied, missing/mismatched, unmarked, or unmerged worktrees and uses `git branch -d`, not force deletion.
+`stop` only stops the process. It keeps isolated worktrees intact. Use `/threads cleanup <thread-id>` after inspecting the result. Cleanup refuses dirty, locked, occupied, missing/mismatched, or unmarked worktrees. It also refuses branches with commits that are neither merged into local `HEAD` nor reachable from any remote-tracking branch. Locally merged branches are deleted with `git branch -d`; locally unmerged branches are deleted only after the remote-reachability proof.
 
 ## Optional runtime config
 
