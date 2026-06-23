@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { ThreadWorktreeManager } from "../src/worktree/thread-worktrees.ts";
-import type { ExecResult } from "../src/worktree/git.ts";
+import type { ExecResult, GitExec } from "../src/worktree/git.ts";
 
 test("allocates isolated worktree from clean source subdir", async () => {
 	const repo = await createGitRepo();
@@ -79,6 +79,83 @@ test("cleanup removes locally unmerged branch reachable from fork remote-trackin
 	assert.equal(await exists(allocated.worktreeRoot), false);
 	assert.notEqual((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
 	assert.equal((await git(repo, ["show-ref", "--verify", `refs/remotes/fork/${allocated.branchName}`])).code, 0);
+});
+
+test("cleanup refuses locally unmerged branch when only a stale remote-tracking ref contains it", async () => {
+	const repo = await createGitRepo();
+	const fork = await createBareGitRepo();
+	const manager = new ThreadWorktreeManager({ processInspector: async () => [] });
+	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-stale-remote", name: "cleanup" }));
+	await fs.writeFile(path.join(allocated.worktreeRoot, "remote.txt"), "remote-backed\n", "utf8");
+	await gitOk(allocated.worktreeRoot, ["add", "remote.txt"]);
+	await gitOk(allocated.worktreeRoot, ["commit", "-m", "remote backed"]);
+	await gitOk(repo, ["remote", "add", "fork", fork]);
+	await gitOk(repo, ["push", "fork", `${allocated.branchName}:refs/heads/${allocated.branchName}`]);
+	await gitOk(repo, ["fetch", "fork"]);
+	await gitOk(repo, ["push", "fork", `:refs/heads/${allocated.branchName}`]);
+	const branchTip = await gitOk(repo, ["rev-parse", `refs/heads/${allocated.branchName}`]);
+	await gitOk(repo, ["update-ref", `refs/remotes/fork/${allocated.branchName}`, branchTip.stdout.trim()]);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/remotes/fork/${allocated.branchName}`])).code, 0);
+
+	const result = await manager.cleanupWorktree(allocated);
+	assert.equal(result.state, "manual_action_required");
+	assert.match(result.message, /not merged into HEAD or reachable from any remote-tracking branch/);
+	assert.equal(await exists(allocated.worktreeRoot), true);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
+	assert.notEqual((await git(repo, ["show-ref", "--verify", `refs/remotes/fork/${allocated.branchName}`])).code, 0);
+});
+
+test("cleanup refuses locally unmerged branch when remote refresh fails", async () => {
+	const repo = await createGitRepo();
+	const fork = await createBareGitRepo();
+	const missingRemote = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "missing-remote-")), "deleted.git");
+	const manager = new ThreadWorktreeManager({ processInspector: async () => [] });
+	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-refresh-fails", name: "cleanup" }));
+	await fs.writeFile(path.join(allocated.worktreeRoot, "remote.txt"), "remote-backed\n", "utf8");
+	await gitOk(allocated.worktreeRoot, ["add", "remote.txt"]);
+	await gitOk(allocated.worktreeRoot, ["commit", "-m", "remote backed"]);
+	await gitOk(repo, ["remote", "add", "fork", fork]);
+	await gitOk(repo, ["push", "fork", `${allocated.branchName}:refs/heads/${allocated.branchName}`]);
+	await gitOk(repo, ["fetch", "fork"]);
+	await gitOk(repo, ["remote", "set-url", "fork", missingRemote]);
+
+	const result = await manager.cleanupWorktree(allocated);
+	assert.equal(result.state, "manual_action_required");
+	assert.match(result.message, /refreshing remote-tracking branches/);
+	assert.equal(await exists(allocated.worktreeRoot), true);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
+});
+
+test("cleanup refuses to delete a remote-backed branch when its tip changes after safety check", async () => {
+	const repo = await createGitRepo();
+	const fork = await createBareGitRepo();
+	let allocatedBranch = "";
+	let advanced = false;
+	const exec: GitExec = async (command, args, options = {}) => {
+		const result = await execGit(command, args, options.cwd);
+		if (!advanced && result.code === 0 && options.cwd === repo && args[0] === "worktree" && args[1] === "remove") {
+			advanced = true;
+			const newCommit = await gitOk(repo, ["commit-tree", "HEAD^{tree}", "-p", `refs/heads/${allocatedBranch}`, "-m", "late local work"]);
+			await gitOk(repo, ["update-ref", `refs/heads/${allocatedBranch}`, newCommit.stdout.trim()]);
+		}
+		return result;
+	};
+	const manager = new ThreadWorktreeManager({ exec, processInspector: async () => [] });
+	const allocated = await manager.createAllocation(await manager.prepareAllocation(repo, { threadId: "thread-race", name: "cleanup" }));
+	allocatedBranch = allocated.branchName;
+	await fs.writeFile(path.join(allocated.worktreeRoot, "remote.txt"), "remote-backed\n", "utf8");
+	await gitOk(allocated.worktreeRoot, ["add", "remote.txt"]);
+	await gitOk(allocated.worktreeRoot, ["commit", "-m", "remote backed"]);
+	await gitOk(repo, ["remote", "add", "fork", fork]);
+	await gitOk(repo, ["push", "fork", `${allocated.branchName}:refs/heads/${allocated.branchName}`]);
+	await gitOk(repo, ["fetch", "fork"]);
+
+	const result = await manager.cleanupWorktree(allocated);
+	assert.equal(result.state, "manual_action_required");
+	assert.match(result.message, /changed after cleanup safety check/);
+	assert.equal(await exists(allocated.worktreeRoot), false);
+	assert.equal((await git(repo, ["show-ref", "--verify", `refs/heads/${allocated.branchName}`])).code, 0);
+	assert.notEqual((await git(repo, ["log", "--format=%H", `refs/heads/${allocated.branchName}`, "--not", "--remotes", "--"])).stdout.trim(), "");
 });
 
 test("cleanup refuses locally unmerged branch with commits unreachable from remotes", async () => {
@@ -170,8 +247,12 @@ async function gitOk(cwd: string, args: string[]): Promise<ExecResult> {
 }
 
 async function git(cwd: string, args: string[]): Promise<ExecResult> {
+	return await execGit("git", args, cwd);
+}
+
+async function execGit(command: string, args: string[], cwd?: string): Promise<ExecResult> {
 	return await new Promise((resolve) => {
-		execFile("git", args, { cwd }, (error, stdout, stderr) => {
+		execFile(command, args, { cwd }, (error, stdout, stderr) => {
 			const errorCode = (error as NodeJS.ErrnoException | null)?.code;
 			const code = typeof errorCode === "number" ? errorCode : error ? 1 : 0;
 			resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });

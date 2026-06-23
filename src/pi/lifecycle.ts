@@ -475,41 +475,54 @@ export class ThreadService implements BrokerRequestHandler {
 	}
 
 	async cleanupThread(threadId: string): Promise<ThreadOperation> {
-		const operationId = `op-${this.randomId()}`;
-		const now = this.now().toISOString();
-		let worktree: Extract<ThreadWorktree, { mode: "isolated" }>;
-		await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-			const thread = requireThread(document, threadId);
-			const legality = isCommandAllowed(thread.status, "cleanup", thread.safetyPolicy);
-			if (!legality.allowed) throw new Error(legality.reason ?? "cleanup not allowed");
-			if (this.handles.has(threadId)) throw new Error(`cleanup requires no live handle for thread ${threadId}`);
-			if (!thread.worktree || thread.worktree.mode === "legacy_shared_cwd") throw new Error("cleanup is not available for legacy shared-cwd threads");
-			worktree = thread.worktree;
-			document.operations[operationId] = createOperation(operationId, "cleanup_worktree", threadId, now);
-		});
-		let result: WorktreeCleanupResult;
-		try {
-			result = await this.worktreeManager.cleanupWorktree(worktree!);
-		} catch (error) {
-			result = { state: "manual_action_required", message: error instanceof Error ? error.message : String(error) };
-		}
-		await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-			const thread = requireThread(document, threadId);
-			const operation = document.operations[operationId];
-			if (thread.worktree?.mode === "isolated") {
-				thread.worktree.cleanupState = result.state;
-				thread.worktree.cleanedAt = result.cleanedAt;
-				thread.worktree.lastError = result.state === "removed" ? undefined : result.message;
-				thread.worktree.lastCheckedAt = this.now().toISOString();
+		return await this.withThreadCommandLock(threadId, async () => {
+			const operationId = `op-${this.randomId()}`;
+			const now = this.now().toISOString();
+			let worktree: Extract<ThreadWorktree, { mode: "isolated" }>;
+			let alreadyRemoved = false;
+			let existingCleanedAt: string | undefined;
+			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
+				const thread = requireThread(document, threadId);
+				const legality = isCommandAllowed(thread.status, "cleanup", thread.safetyPolicy);
+				if (!legality.allowed) throw new Error(legality.reason ?? "cleanup not allowed");
+				if (this.handles.has(threadId)) throw new Error(`cleanup requires no live handle for thread ${threadId}`);
+				if (!thread.worktree || thread.worktree.mode === "legacy_shared_cwd") throw new Error("cleanup is not available for legacy shared-cwd threads");
+				worktree = thread.worktree;
+				alreadyRemoved = thread.worktree.cleanupState === "removed";
+				existingCleanedAt = thread.worktree.cleanedAt;
+				document.operations[operationId] = createOperation(operationId, "cleanup_worktree", threadId, now);
+			});
+			let result: WorktreeCleanupResult;
+			if (alreadyRemoved) {
+				result = { state: "removed", message: "worktree already removed", cleanedAt: existingCleanedAt };
+			} else {
+				try {
+					result = await this.worktreeManager.cleanupWorktree(worktree!);
+				} catch (error) {
+					result = { state: "manual_action_required", message: error instanceof Error ? error.message : String(error) };
+				}
 			}
-			operation.status = result.state === "removed" ? "completed" : "manual_action_required";
-			operation.message = result.message;
-			operation.error = result.state === "removed" ? undefined : result.message;
-			operation.recoveryAction = result.state === "removed" ? undefined : "manual";
-			operation.updatedAt = this.now().toISOString();
-			thread.updatedAt = this.now().toISOString();
+			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
+				const thread = requireThread(document, threadId);
+				const operation = document.operations[operationId];
+				const finalResult = thread.worktree?.mode === "isolated" && thread.worktree.cleanupState === "removed" && result.state !== "removed"
+					? { state: "removed" as const, message: "worktree already removed", cleanedAt: thread.worktree.cleanedAt }
+					: result;
+				if (thread.worktree?.mode === "isolated") {
+					thread.worktree.cleanupState = finalResult.state;
+					thread.worktree.cleanedAt = finalResult.cleanedAt;
+					thread.worktree.lastError = finalResult.state === "removed" ? undefined : finalResult.message;
+					thread.worktree.lastCheckedAt = this.now().toISOString();
+				}
+				operation.status = finalResult.state === "removed" ? "completed" : "manual_action_required";
+				operation.message = finalResult.message;
+				operation.error = finalResult.state === "removed" ? undefined : finalResult.message;
+				operation.recoveryAction = finalResult.state === "removed" ? undefined : "manual";
+				operation.updatedAt = this.now().toISOString();
+				thread.updatedAt = this.now().toISOString();
+			});
+			return (await readThreadStore(this.statePath, this.managerDir)).operations[operationId];
 		});
-		return (await readThreadStore(this.statePath, this.managerDir)).operations[operationId];
 	}
 
 	async reconcileAfterRestart(): Promise<void> {
