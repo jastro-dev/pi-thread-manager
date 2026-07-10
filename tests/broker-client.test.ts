@@ -8,8 +8,8 @@ import test from "node:test";
 import { ThreadManagerClient } from "../src/broker/client.ts";
 import { loadOrCreateAuthRoot } from "../src/broker/auth.ts";
 import { createMessageReader, writeMessage } from "../src/broker/framing.ts";
-import { getBrokerSocketPath } from "../src/broker/paths.ts";
-import { buildBrokerEnv, getBrokerLaunchSpec } from "../src/broker/spawn.ts";
+import { getBrokerPidPath, getBrokerSocketPath, getThreadManagerDir, getThreadStorePath } from "../src/broker/paths.ts";
+import { buildBrokerEnv, getBrokerLaunchSpec, spawnBrokerIfNeeded } from "../src/broker/spawn.ts";
 import { startThreadBroker, type BrokerRequestHandler } from "../src/broker/broker.ts";
 import { normalizeSafetyPolicy } from "../src/protocol.ts";
 import { createEmptyThreadStore, writeThreadStore } from "../src/store/thread-store.ts";
@@ -129,6 +129,39 @@ test("broker refuses to unlink a live socket", { skip: process.platform === "win
 	}
 });
 
+test("replaces a live stale v2 broker before launching the v3 broker", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-broker-upgrade-"));
+	const socketPath = getBrokerSocketPath(process.platform, root);
+	const managerDir = getThreadManagerDir(root);
+	const pidPath = getBrokerPidPath(root);
+	let oldBroker: Awaited<ReturnType<typeof startThreadBroker>> | undefined = await startThreadBroker({
+		socketPath,
+		pidPath,
+		managerDir,
+		storePath: getThreadStorePath(root),
+		platform: process.platform,
+		homeDir: root,
+		requiredToken: loadOrCreateAuthRoot(root).rootToken,
+		protocolVersion: PROTOCOL_VERSION - 1,
+		handler: { handle: async () => ({}) },
+	});
+	try {
+		let launched = false;
+		await spawnBrokerIfNeeded({
+			homeDir: root,
+			platform: process.platform,
+			replaceIncompatibleBroker: async () => {
+				await oldBroker?.close();
+				oldBroker = undefined;
+			},
+			launchBroker: async () => { launched = true; },
+		});
+		assert.equal(launched, true);
+	} finally {
+		await oldBroker?.close();
+	}
+});
+
 test("client receives handshake version mismatch on handshake request", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-broker-"));
 	const socketPath = testSocketPath(root);
@@ -220,6 +253,43 @@ test("broker validates scoped token against every requested thread id", async ()
 		const client = new ThreadManagerClient({ socketPath, homeDir: root, token: "scoped-secret", requestTimeoutMs: 500 });
 		await client.connect();
 		await assert.rejects(() => client.request("schedule", { threadIds: ["thread-1", "thread-2"] }, "sched-1"), /not scoped/);
+		client.disconnect();
+	} finally {
+		await broker.close();
+	}
+});
+
+test("broker scopes supervision acknowledgements to capability token threads", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-broker-supervision-auth-"));
+	const managerDir = getThreadManagerDir(root);
+	const statePath = getThreadStorePath(root);
+	const auth = loadOrCreateAuthRoot(root);
+	auth.tokens.push({ id: "supervision-scoped", secret: "supervision-secret", clientId: "client", actions: ["handshake", "supervision"], threadIds: ["thread-1"] });
+	await fs.writeFile(path.join(managerDir, "auth-root.json"), `${JSON.stringify(auth)}\n`);
+	const document = createEmptyThreadStore(new Date("2026-01-01T00:00:00.000Z"));
+	for (const threadId of ["thread-1", "thread-2"]) {
+		document.threads[threadId] = {
+			id: threadId,
+			status: "idle",
+			cwd: root,
+			tags: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			createdBy: "test",
+			ownerSessionId: "parent",
+			launchProfile: { cwd: root, extensionLoading: "inherit", approvalMode: "ask", inheritedFromParent: true },
+			safetyPolicy: normalizeSafetyPolicy(),
+			worktree: { mode: "legacy_shared_cwd", sourceCwd: root, cleanupState: "not_applicable" },
+		};
+	}
+	document.supervision.pendingWakes["wake-2"] = { id: "wake-2", threadId: "thread-2", ownerSessionId: "parent", status: "idle", createdAt: "2026-01-01T00:00:00.000Z" };
+	await writeThreadStore(statePath, document);
+	const socketPath = testSocketPath(root);
+	const broker = await startThreadBroker({ socketPath, pidPath: getBrokerPidPath(root), managerDir, storePath: statePath, platform: process.platform, homeDir: root, handler: { handle: async () => ({ ok: true }) } });
+	try {
+		const client = new ThreadManagerClient({ socketPath, homeDir: root, token: "supervision-secret", requestTimeoutMs: 500 });
+		await client.connect();
+		await assert.rejects(() => client.request("supervision", { operation: "ack", eventId: "wake-2", ownerSessionId: "parent" }, "ack-2"), /not scoped/);
 		client.disconnect();
 	} finally {
 		await broker.close();

@@ -73,6 +73,26 @@ test("supervision service persists claim and acknowledgement state", async () =>
 	assert.equal(acknowledged.snapshot.inFlightWakeCount, 0);
 });
 
+test("supervision wakes stay with their owning parent session", async () => {
+	const { service, managerDir } = await createService();
+	const parentA = await service.createThread({ cwd: managerDir, createdBy: "test", ownerSessionId: "parent-a", safetyPolicy: sharedSafetyPolicy() });
+	const parentB = await service.createThread({ cwd: managerDir, createdBy: "test", ownerSessionId: "parent-b", safetyPolicy: sharedSafetyPolicy() });
+	const contextA = { clientId: "client-a", ownerSessionId: "parent-a" };
+	const contextB = { clientId: "client-b", ownerSessionId: "parent-b" };
+	const snapshotA = await service.handleSupervision("poll", undefined, contextA) as { pendingWakeCount: number };
+	const snapshotB = await service.handleSupervision("poll", undefined, contextB) as { pendingWakeCount: number };
+	assert.equal(snapshotA.pendingWakeCount, 1);
+	assert.equal(snapshotB.pendingWakeCount, 1);
+	const claimedA = await service.handleSupervision("claim", undefined, contextA) as { event: { id: string } };
+	assert.ok(claimedA.event);
+	await assert.rejects(() => service.handleSupervision("ack", claimedA.event.id, contextB), /owned by another parent session/);
+	const remainingB = await service.handleSupervision("claim", undefined, contextB) as { event: { id: string; threadId: string } };
+	assert.equal(remainingB.event.threadId, parentB.id);
+	await service.handleSupervision("ack", claimedA.event.id, contextA);
+	await service.handleSupervision("ack", remainingB.event.id, contextB);
+	assert.equal(parentA.ownerSessionId, "parent-a");
+});
+
 test("creates idle thread with explicit launch profile and pid", async () => {
 	const { service, statePath, managerDir, rpc } = await createService();
 	const thread = await service.createThread({ cwd: managerDir, model: "openai/test", name: "worker", createdBy: "test", safetyPolicy: sharedSafetyPolicy(), launchProfile: { inheritedFromParent: false } });
@@ -440,6 +460,15 @@ test("idle refresh does not complete undispatched current operation", async () =
 	assert.equal(store.threads[thread.id].currentOperationId, "op-undispatched");
 });
 
+test("idle unarmed supervision poll does not rewrite the store", async () => {
+	const { service, statePath, managerDir } = await createService();
+	await service.status();
+	const before = await readThreadStore(statePath, managerDir);
+	await service.handleSupervision("poll", undefined, { clientId: "client", ownerSessionId: "parent" });
+	const after = await readThreadStore(statePath, managerDir);
+	assert.equal(after.updatedAt, before.updatedAt);
+});
+
 test("reconcile refuses PID-only adoption after daemon restart", async () => {
 	const { service, statePath, managerDir } = await createService();
 	const thread = await service.createThread({ cwd: managerDir, createdBy: "test", safetyPolicy: sharedSafetyPolicy() });
@@ -448,6 +477,23 @@ test("reconcile refuses PID-only adoption after daemon restart", async () => {
 	const store = await readThreadStore(statePath, managerDir);
 	assert.equal(store.threads[thread.id].status, "orphan_needs_manual_action");
 	assert.match(store.threads[thread.id].lastError ?? "", /reconnectable/);
+});
+
+test("reconcile approval-blocked thread becomes stoppable after restart", async () => {
+	const { service, statePath, managerDir } = await createService();
+	const thread = await service.createThread({ cwd: managerDir, createdBy: "test", safetyPolicy: sharedSafetyPolicy() });
+	await mutateThreadStore({ statePath, managerDir }, (document) => {
+		document.threads[thread.id].status = "approval_blocked";
+		document.threads[thread.id].lastError = "manual approval required";
+	});
+	const restarted = new ThreadService({ statePath, managerDir, randomId: () => "restart" });
+	await restarted.reconcileAfterRestart();
+	let store = await readThreadStore(statePath, managerDir);
+	assert.equal(store.threads[thread.id].status, "orphan_needs_manual_action");
+	const stop = await restarted.stopThread(thread.id);
+	store = await readThreadStore(statePath, managerDir);
+	assert.equal(stop.status, "completed");
+	assert.equal(store.threads[thread.id].status, "stopped");
 });
 
 test("reconcile fails creating threads left before launch", async () => {

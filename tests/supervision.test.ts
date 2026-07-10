@@ -7,6 +7,7 @@ import {
 	claimNextWake,
 	consumeNextWake,
 	observeThreadTransition,
+	recoverExpiredInFlightWakes,
 	recoverInFlightWakes,
 	rejectWake,
 	shouldRunTurnEndGuard,
@@ -68,6 +69,30 @@ test("claimed wakes recover after restart and consumption is durable", () => {
 	assert.equal(state.consumedEventIds[claimed.id], "2026-01-01T00:02:00.000Z");
 });
 
+test("ownership isolates concurrent parent sessions and leases recover only when stale", () => {
+	const state = createState();
+	observeThreadTransition(state, createThread({ id: "thread-a", ownerSessionId: "parent-a", status: "idle" }), now, "parent-a");
+	observeThreadTransition(state, createThread({ id: "thread-b", ownerSessionId: "parent-b", status: "idle" }), now, "parent-b");
+	const claimedA = claimNextWake(state, "parent-a", now);
+	assert.equal(claimedA?.ownerSessionId, "parent-a");
+	assert.equal(claimNextWake(state, "parent-b", now)?.ownerSessionId, "parent-b");
+	assert.equal(acknowledgeWake(state, claimedA!.id, now, "parent-b"), undefined);
+	assert.equal(Object.keys(state.inFlightWakes).length, 2);
+	assert.equal(acknowledgeWake(state, claimedA!.id, now, "parent-a")?.ownerSessionId, "parent-a");
+	const claimedB = Object.values(state.inFlightWakes).find((event) => event.ownerSessionId === "parent-b");
+	assert.ok(claimedB);
+	assert.equal(acknowledgeWake(state, claimedB.id, now, "parent-b")?.ownerSessionId, "parent-b");
+
+	observeThreadTransition(state, createThread({ id: "thread-a", ownerSessionId: "parent-a", status: "failed" }), "2026-01-01T00:00:01.000Z", "parent-a");
+	const staleClaim = claimNextWake(state, "parent-a", "2026-01-01T00:00:01.000Z", 1000);
+	assert.ok(staleClaim);
+	recoverExpiredInFlightWakes(state, "2026-01-01T00:00:01.500Z", "parent-a");
+	assert.equal(Object.keys(state.inFlightWakes).length, 1);
+	recoverExpiredInFlightWakes(state, "2026-01-01T00:00:02.100Z", "parent-a");
+	assert.equal(Object.keys(state.inFlightWakes).length, 0);
+	assert.equal(Object.keys(state.pendingWakes).length, 1);
+});
+
 test("rejected wake is requeued and turn-end guard only runs when needed", () => {
 	const state = createState();
 	observeThreadTransition(state, createThread({ status: "idle" }), now);
@@ -89,7 +114,8 @@ test("watcher notifies once and acknowledges only after delivery", async () => {
 	const watcher = new SupervisionWatcher({
 		spawnBroker: async () => undefined,
 		createClient: () => client,
-		sendUserMessage: async (message) => { messages.push(message); },
+		sendUserMessage: (message) => { messages.push(message); },
+		waitForDelivery: async () => undefined,
 	});
 
 	await watcher.runOnce();
@@ -109,8 +135,8 @@ test("watcher requeues a wake when parent delivery fails", async () => {
 	const watcher = new SupervisionWatcher({
 		spawnBroker: async () => undefined,
 		createClient: () => client,
-		sendUserMessage: async () => {
-			attempts += 1;
+		sendUserMessage: () => { attempts += 1; },
+		waitForDelivery: async () => {
 			if (attempts === 1) throw new Error("parent unavailable");
 		},
 	});
@@ -134,15 +160,17 @@ class FakeSupervisionClient {
 	async request<T>(command: "supervision", params: Record<string, unknown> = {}): Promise<T> {
 		const operation = String(params.operation ?? "poll");
 		this.calls.push(operation);
-		if (operation === "poll") recoverInFlightWakes(this.state);
-		if (operation === "arm" || operation === "disarm") this.state.armed = operation === "arm";
-		if (operation === "claim") return { event: claimNextWake(this.state), snapshot: this.snapshot() } as T;
+		if (operation === "arm" || operation === "disarm") {
+			this.state.armedOwners.legacy = operation === "arm";
+			this.state.armed = operation === "arm";
+		}
+		if (operation === "claim") return { event: claimNextWake(this.state, "legacy"), snapshot: this.snapshot() } as T;
 		if (operation === "ack") {
-			acknowledgeWake(this.state, String(params.eventId), "2026-01-01T00:03:00.000Z");
+			acknowledgeWake(this.state, String(params.eventId), "2026-01-01T00:03:00.000Z", "legacy");
 			return { snapshot: this.snapshot() } as T;
 		}
 		if (operation === "nack") {
-			rejectWake(this.state, String(params.eventId));
+			rejectWake(this.state, String(params.eventId), "legacy");
 			return this.snapshot() as T;
 		}
 		return this.snapshot() as T;
@@ -152,7 +180,7 @@ class FakeSupervisionClient {
 
 	private snapshot(): SupervisionSnapshot {
 		return {
-			armed: this.state.armed,
+			armed: this.state.armedOwners.legacy === true,
 			activeThreadCount: 1,
 			pendingWakeCount: Object.keys(this.state.pendingWakes).length,
 			inFlightWakeCount: Object.keys(this.state.inFlightWakes).length,
@@ -162,8 +190,30 @@ class FakeSupervisionClient {
 }
 
 function createState(): ThreadSupervisionState {
-	return { armed: false, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} };
+	return { armed: false, armedOwners: {}, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} };
 }
+
+test("idle watcher does not keep a polling timer", async () => {
+	let polls = 0;
+	const watcher = new SupervisionWatcher({
+		spawnBroker: async () => undefined,
+		createClient: () => ({
+			connect: async () => undefined,
+			request: async <T>() => {
+				polls += 1;
+				return { armed: false, activeThreadCount: 0, pendingWakeCount: 0, inFlightWakeCount: 0 } as T;
+			},
+			disconnect: () => undefined,
+		}),
+		sendUserMessage: () => undefined,
+		waitForDelivery: async () => undefined,
+		intervalMs: 5,
+	});
+	await watcher.start();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(polls, 1);
+	await watcher.stop();
+});
 
 function createThread(overrides: Partial<ManagedThread> = {}): ManagedThread {
 	return {

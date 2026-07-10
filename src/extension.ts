@@ -30,16 +30,29 @@ export default function threadManagerExtension(pi: ExtensionAPI, deps: ThreadMan
 	const createClient = deps.createClient ?? (() => new ThreadManagerClient());
 	const eventApi = pi as unknown as { on?: ExtensionAPI["on"] };
 	if (typeof eventApi.on === "function") {
+		const delivery = new UserMessageDeliveryTracker();
 		const watcher = new SupervisionWatcher({
 			spawnBroker,
 			createClient,
-			sendUserMessage: (content, options) => pi.sendUserMessage(content, options),
+			sendUserMessage: (content, options) => {
+				delivery.expect(content);
+				pi.sendUserMessage(content, options);
+			},
+			waitForDelivery: (content) => delivery.wait(content),
 			intervalMs: deps.supervisionIntervalMs,
 			onError: (error) => console.error(`Thread-manager supervision watcher failed: ${error instanceof Error ? error.message : String(error)}`),
 		});
-		eventApi.on("session_start", async () => watcher.start());
+		eventApi.on("session_start", async (_event, ctx) => {
+			watcher.setOwnerSessionId(ctx.sessionManager.getSessionId());
+			await watcher.start();
+		});
 		eventApi.on("session_shutdown", async () => watcher.stop());
 		eventApi.on("turn_end", async () => watcher.runTurnEndGuard());
+		eventApi.on("message_start", (event) => {
+			if (event.message.role !== "user") return;
+			const content = userMessageText(event.message);
+			if (content) delivery.started(content);
+		});
 	}
 
 	pi.registerCommand("threads", {
@@ -97,7 +110,7 @@ export default function threadManagerExtension(pi: ExtensionAPI, deps: ThreadMan
 		},
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const action = normalizeToolAction(params.action);
-			const plan: CommandPlan = { action, params: normalizeToolParams(action, { ...params, cwd: params.cwd ?? ctx.cwd, createdBy: "tool" }) };
+			const plan: CommandPlan = { action, params: withOwnerSession(normalizeToolParams(action, { ...params, cwd: params.cwd ?? ctx.cwd, createdBy: "tool" }), ctx) };
 			const result = await executePlan(plan, spawnBroker, createClient, toProtocolRequestId(toolCallId));
 			const text = formatToolResult(result);
 			return { content: [{ type: "text", text }], details: result };
@@ -121,6 +134,7 @@ export async function runThreadCommand(
 	createClient: () => BrokerPort,
 ): Promise<string> {
 	const plan = parseThreadCommand(args, ctx.cwd);
+	plan.params = withOwnerSession(plan.params, ctx);
 	const result = await executePlan(plan, spawnBroker, createClient);
 	return formatToolResult(result);
 }
@@ -217,6 +231,63 @@ function setOption(token: string, params: Record<string, unknown>): boolean {
 	if (!match) return false;
 	params[match[1]] = coerceCommandValue(match[1], match[2]);
 	return true;
+}
+
+function withOwnerSession(params: Record<string, unknown>, ctx: unknown): Record<string, unknown> {
+	const sessionManager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
+	const ownerSessionId = sessionManager?.getSessionId?.();
+	return ownerSessionId ? { ...params, ownerSessionId } : params;
+}
+
+function userMessageText(message: { content?: unknown }): string | undefined {
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return undefined;
+	const text = message.content
+		.filter((part): part is { type: "text"; text: string } => Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string"))
+		.map((part) => part.text)
+		.join("\\n");
+	return text || undefined;
+}
+
+class UserMessageDeliveryTracker {
+	private readonly expected = new Set<string>();
+	private readonly startedMessages = new Set<string>();
+	private readonly waiters = new Map<string, Array<{ resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>>();
+
+	expect(content: string): void {
+		this.expected.add(content);
+	}
+
+	wait(content: string): Promise<void> {
+		if (this.startedMessages.delete(content)) {
+			this.expected.delete(content);
+			return Promise.resolve();
+		}
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				const pending = this.waiters.get(content) ?? [];
+				this.waiters.set(content, pending.filter((waiter) => waiter.timer !== timer));
+				reject(new Error("Pi did not start the supervision wake message"));
+			}, 10_000);
+			const pending = this.waiters.get(content) ?? [];
+			pending.push({ resolve: () => { clearTimeout(timer); resolve(); }, reject, timer });
+			this.waiters.set(content, pending);
+		});
+	}
+
+	started(content: string): void {
+		if (!this.expected.has(content)) return;
+		const pending = this.waiters.get(content);
+		if (pending?.length) {
+			const [waiter, ...rest] = pending;
+			if (rest.length) this.waiters.set(content, rest);
+			else this.waiters.delete(content);
+			this.expected.delete(content);
+			waiter.resolve();
+			return;
+		}
+		this.startedMessages.add(content);
+	}
 }
 
 function coerceCommandValue(key: string, value: string): string | number {

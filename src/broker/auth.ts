@@ -40,6 +40,12 @@ export function getRootToken(homeDir?: string): string {
 	return loadOrCreateAuthRoot(homeDir).rootToken;
 }
 
+export function getCapabilityToken(secret: string | undefined, homeDir?: string): CapabilityToken | undefined {
+	if (!secret) return undefined;
+	const root = loadOrCreateAuthRoot(homeDir);
+	return root.tokens.find((token) => constantTimeEqual(secret, token.secret));
+}
+
 export function authorizeSecret(
 	secret: string | undefined,
 	request: { action: ThreadAction; threadId?: string; cwd?: string; now?: Date },

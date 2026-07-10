@@ -42,7 +42,7 @@ export function createEmptyThreadStore(now: Date = new Date()): ThreadStoreDocum
 		approvals: {},
 		jobRuns: {},
 		commitPushDeliveries: {},
-		supervision: { armed: false, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} },
+		supervision: { armed: false, armedOwners: {}, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} },
 	};
 }
 
@@ -167,10 +167,16 @@ export function migrateThreadStoreDocument(document: Record<string, unknown>): P
 		}
 	}
 	if (storeVersion === 1 || (migrated.storeVersion as number | undefined) === 2) {
-		(migrated as { storeVersion?: number }).storeVersion = STORE_VERSION;
+		(migrated as { storeVersion?: number }).storeVersion = 3;
 		migrated.minReaderVersion = MIN_READER_VERSION;
 		migrated.migrationHistory = [...(Array.isArray(migrated.migrationHistory) ? migrated.migrationHistory : []), "v2_to_v3_supervision_state"];
 		migrated.supervision = normalizeSupervisionState(migrated.supervision);
+	}
+	if ((migrated.storeVersion as number | undefined) === 3) {
+		(migrated as { storeVersion?: number }).storeVersion = STORE_VERSION;
+		migrated.minReaderVersion = MIN_READER_VERSION;
+		migrated.migrationHistory = [...(Array.isArray(migrated.migrationHistory) ? migrated.migrationHistory : []), "v3_to_v4_owner_scoped_supervision"];
+		migrated.supervision = migrateUnownedSupervisionState(migrated.supervision, migrated.threads);
 	}
 	if ((migrated.storeVersion as number | undefined) === STORE_VERSION && isRecord(migrated.supervision)) {
 		migrated.supervision = normalizeSupervisionState(migrated.supervision);
@@ -256,22 +262,41 @@ function assertThreadWorktreeInvariants(id: string, thread: ManagedThread): void
 }
 
 function assertSupervisionInvariants(document: ThreadStoreDocument): void {
-	if (typeof document.supervision?.armed !== "boolean" || !isRecord(document.supervision.lastSeen) || !isRecord(document.supervision.pendingWakes) || !isRecord(document.supervision.inFlightWakes) || !isRecord(document.supervision.consumedEventIds)) {
+	if (typeof document.supervision?.armed !== "boolean" || !isRecord(document.supervision.armedOwners) || !isRecord(document.supervision.lastSeen) || !isRecord(document.supervision.pendingWakes) || !isRecord(document.supervision.inFlightWakes) || !isRecord(document.supervision.consumedEventIds)) {
 		throw new Error("Thread supervision state is invalid");
 	}
 	for (const [kind, events] of [["pending", document.supervision.pendingWakes], ["in-flight", document.supervision.inFlightWakes]] as const) {
 		for (const [id, event] of Object.entries(events)) {
-			if (event.id !== id || !document.threads[event.threadId] || !["idle", "failed", "crashed", "approval_blocked"].includes(event.status)) {
+			if (event.id !== id || typeof event.ownerSessionId !== "string" || event.ownerSessionId.length === 0 || !document.threads[event.threadId] || !["idle", "failed", "crashed", "approval_blocked"].includes(event.status)) {
 				throw new Error(`Thread supervision ${kind} wake ${id} is invalid`);
 			}
 		}
 	}
 }
 
+function migrateUnownedSupervisionState(value: unknown, threads: unknown): ThreadStoreDocument["supervision"] {
+	const state = normalizeSupervisionState(value);
+	for (const event of [...Object.values(state.pendingWakes), ...Object.values(state.inFlightWakes)]) delete state.lastSeen[event.threadId];
+	state.pendingWakes = {};
+	state.inFlightWakes = {};
+	state.armed = false;
+	state.armedOwners = {};
+	if (isRecord(threads)) {
+		for (const [threadId, thread] of Object.entries(threads)) {
+			if (isRecord(thread) && ["idle", "failed", "crashed", "approval_blocked"].includes(String(thread.status)) && !thread.ownerSessionId) delete state.lastSeen[threadId];
+		}
+	}
+	return state;
+}
+
 function normalizeSupervisionState(value: unknown): ThreadStoreDocument["supervision"] {
 	const input = isRecord(value) ? value : {};
+	const armedOwners = isRecord(input.armedOwners)
+		? Object.fromEntries(Object.entries(input.armedOwners).filter(([, armed]) => armed === true).map(([owner]) => [owner, true]))
+		: {};
 	return {
-		armed: input.armed === true,
+		armed: Object.keys(armedOwners).length > 0,
+		armedOwners,
 		lastSeen: isRecord(input.lastSeen) ? input.lastSeen as Record<string, string> : {},
 		pendingWakes: isRecord(input.pendingWakes) ? input.pendingWakes as ThreadStoreDocument["supervision"]["pendingWakes"] : {},
 		inFlightWakes: isRecord(input.inFlightWakes) ? input.inFlightWakes as ThreadStoreDocument["supervision"]["inFlightWakes"] : {},

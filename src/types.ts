@@ -1,5 +1,5 @@
-export const PROTOCOL_VERSION = 2;
-export const STORE_VERSION = 3;
+export const PROTOCOL_VERSION = 3;
+export const STORE_VERSION = 4;
 export const MIN_READER_VERSION = 1;
 
 export const THREAD_MANAGER_NAME = "pi-thread-manager";
@@ -161,6 +161,7 @@ export interface ManagedThread {
 	currentOperationId?: string;
 	launchProfile: LaunchProfile;
 	safetyPolicy: SafetyPolicy;
+	ownerSessionId?: string;
 	worktree?: ThreadWorktree;
 }
 
@@ -280,14 +281,18 @@ export interface ThreadStoreDocument {
 export interface ThreadSupervisionEvent {
 	id: string;
 	threadId: string;
+	ownerSessionId: string;
 	status: ActionableThreadStatus;
 	createdAt: string;
 	lastActivityAt?: string;
 	error?: string;
+	claimedAt?: string;
+	leaseExpiresAt?: string;
 }
 
 export interface ThreadSupervisionState {
 	armed: boolean;
+	armedOwners: Record<string, boolean>;
 	lastSeen: Record<string, string>;
 	pendingWakes: Record<string, ThreadSupervisionEvent>;
 	inFlightWakes: Record<string, ThreadSupervisionEvent>;
@@ -371,6 +376,7 @@ export interface CreateThreadInput {
 	tags?: string[];
 	createdBy: string;
 	parentThreadId?: string;
+	ownerSessionId?: string;
 	worktreeMode?: WorktreeMode;
 	baseRef?: string;
 	launchProfile?: Partial<LaunchProfile>;

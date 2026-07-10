@@ -10,30 +10,44 @@ export interface SupervisionClientPort {
 export interface SupervisionWatcherDeps {
 	spawnBroker: () => Promise<void>;
 	createClient: () => SupervisionClientPort;
-	sendUserMessage: (content: string, options?: { deliverAs?: "followUp" }) => void | Promise<void>;
+	sendUserMessage: (content: string, options?: { deliverAs?: "followUp" }) => void;
+	waitForDelivery: (content: string) => Promise<void>;
 	intervalMs?: number;
 	onError?: (error: unknown) => void;
+	ownerSessionId?: string;
 }
 
 export class SupervisionWatcher {
 	private readonly intervalMs: number;
 	private readonly onError: (error: unknown) => void;
 	private timer?: ReturnType<typeof setInterval>;
-	private running?: Promise<void>;
+	private running?: Promise<boolean>;
 	private started = false;
+	private ownerSessionId: string;
 
 	constructor(private readonly deps: SupervisionWatcherDeps) {
 		this.intervalMs = deps.intervalMs ?? 2000;
 		this.onError = deps.onError ?? (() => undefined);
+		this.ownerSessionId = deps.ownerSessionId ?? "legacy";
+	}
+
+	setOwnerSessionId(ownerSessionId: string): void {
+		if (!ownerSessionId) throw new Error("supervision watcher requires a parent session id");
+		this.ownerSessionId = ownerSessionId;
 	}
 
 	async start(): Promise<void> {
 		if (this.started) return;
 		this.started = true;
-		await this.runOnce();
-		if (!this.started) return;
+		const needed = await this.runOnce();
+		if (!this.started || !needed) return;
 		this.timer = setInterval(() => {
-			void this.runOnce();
+			void this.runOnce().then((stillNeeded) => {
+				if (!stillNeeded && this.timer) {
+					clearInterval(this.timer);
+					this.timer = undefined;
+				}
+			});
 		}, this.intervalMs);
 		this.timer.unref?.();
 	}
@@ -52,7 +66,7 @@ export class SupervisionWatcher {
 			const client = this.deps.createClient();
 			try {
 				await client.connect();
-				await client.request<SupervisionSnapshot>("supervision", { operation: "disarm" });
+				await client.request<SupervisionSnapshot>("supervision", this.ownerParams({ operation: "disarm" }));
 			} finally {
 				client.disconnect?.();
 			}
@@ -61,39 +75,41 @@ export class SupervisionWatcher {
 		}
 	}
 
-	async runOnce(guardOnly = false): Promise<void> {
-		if (this.running) return this.running;
+	async runOnce(guardOnly = false): Promise<boolean> {
+		if (this.running) return await this.running;
 		const current = this.cycle(guardOnly).catch((error) => {
 			this.onError(error);
+			return true;
 		});
 		this.running = current;
 		try {
-			await current;
+			return await current;
 		} finally {
 			if (this.running === current) this.running = undefined;
 		}
 	}
 
 	async runTurnEndGuard(): Promise<void> {
-		return this.runOnce(true);
+		await this.runOnce(true);
 	}
 
-	private async cycle(guardOnly: boolean): Promise<void> {
+	private async cycle(guardOnly: boolean): Promise<boolean> {
 		await this.deps.spawnBroker();
 		const client = this.deps.createClient();
 		try {
 			await client.connect();
-			let snapshot = await client.request<SupervisionSnapshot>("supervision", { operation: "poll" });
-			if (guardOnly && !shouldRunTurnEndGuard(snapshot)) return;
+			let snapshot = await client.request<SupervisionSnapshot>("supervision", this.ownerParams({ operation: "poll" }));
+			if (guardOnly && !shouldRunTurnEndGuard(snapshot)) return false;
 
 			if (snapshot.pendingWakeCount > 0) {
 				snapshot = await this.drainPendingWakes(client, snapshot);
 			}
 			if (shouldArmWatcher(snapshot)) {
-				if (!snapshot.armed) snapshot = await client.request<SupervisionSnapshot>("supervision", { operation: "arm" });
-			} else if (snapshot.armed) {
-				await client.request<SupervisionSnapshot>("supervision", { operation: "disarm" });
+				if (!snapshot.armed) snapshot = await client.request<SupervisionSnapshot>("supervision", this.ownerParams({ operation: "arm" }));
+				return shouldArmWatcher(snapshot);
 			}
+			if (snapshot.armed) await client.request<SupervisionSnapshot>("supervision", this.ownerParams({ operation: "disarm" }));
+			return false;
 		} finally {
 			client.disconnect?.();
 		}
@@ -102,18 +118,24 @@ export class SupervisionWatcher {
 	private async drainPendingWakes(client: SupervisionClientPort, initialSnapshot: SupervisionSnapshot): Promise<SupervisionSnapshot> {
 		let snapshot = initialSnapshot;
 		while (snapshot.pendingWakeCount > 0) {
-			const result = await client.request<{ event?: ThreadSupervisionEvent; snapshot: SupervisionSnapshot }>("supervision", { operation: "claim" });
+			const result = await client.request<{ event?: ThreadSupervisionEvent; snapshot: SupervisionSnapshot }>("supervision", this.ownerParams({ operation: "claim" }));
 			if (!result.event) return result.snapshot;
 			try {
-				await this.deps.sendUserMessage(formatWakeMessage(result.event), { deliverAs: "followUp" });
-				const acknowledged = await client.request<{ snapshot: SupervisionSnapshot }>("supervision", { operation: "ack", eventId: result.event.id });
+				const message = formatWakeMessage(result.event);
+				this.deps.sendUserMessage(message, { deliverAs: "followUp" });
+				await this.deps.waitForDelivery(message);
+				const acknowledged = await client.request<{ snapshot: SupervisionSnapshot }>("supervision", this.ownerParams({ operation: "ack", eventId: result.event.id }));
 				snapshot = acknowledged.snapshot;
 			} catch (error) {
-				await client.request("supervision", { operation: "nack", eventId: result.event.id }).catch(() => undefined);
+				await client.request("supervision", this.ownerParams({ operation: "nack", eventId: result.event.id })).catch(() => undefined);
 				throw error;
 			}
 		}
 		return snapshot;
+	}
+
+	private ownerParams(params: Record<string, unknown>): Record<string, unknown> {
+		return { ...params, ownerSessionId: this.ownerSessionId };
 	}
 }
 

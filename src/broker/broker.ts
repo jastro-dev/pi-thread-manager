@@ -8,12 +8,14 @@ import { validateBrokerRequest } from "../protocol.ts";
 import { PROTOCOL_VERSION, type BrokerRequest, type BrokerResponse, type DaemonStatus, type ProtocolLimits, type ThreadAction } from "../types.ts";
 import { readThreadStore } from "../store/thread-store.ts";
 import { createThreadService } from "../pi/lifecycle.ts";
-import { authorizeSecret } from "./auth.ts";
+import { authorizeSecret, getCapabilityToken } from "./auth.ts";
 import { createMessageReader, writeMessage } from "./framing.ts";
 import { getBrokerPidPath, getBrokerSocketPath, getThreadManagerDir, getThreadStorePath } from "./paths.ts";
 
 export interface BrokerRequestContext {
 	clientId: string;
+	ownerSessionId?: string;
+	authorizedThreadIds?: string[];
 	token?: string;
 	requestId?: string;
 }
@@ -154,27 +156,36 @@ async function handleSocketMessage(args: {
 	}
 
 	try {
-		const data = await args.options.handler.handle(request.command, request.params ?? {}, { clientId: args.clientId, token: request.token, requestId: request.id });
+		const params = request.params ?? {};
+		const ownerSessionId = typeof params.ownerSessionId === "string" && params.ownerSessionId.length > 0 ? params.ownerSessionId : undefined;
+		const data = await args.options.handler.handle(request.command, params, { clientId: args.clientId, ownerSessionId, authorizedThreadIds: auth.threadIds, token: request.token, requestId: request.id });
 		writeResponse(args.socket, { type: "response", id: request.id, command: request.command, success: true, data }, args.options.limits);
 	} catch (error) {
 		writeResponse(args.socket, { type: "response", id: request.id, command: request.command, success: false, error: error instanceof Error ? error.message : String(error) }, args.options.limits);
 	}
 }
 
-async function authorizeBrokerToken(options: ThreadBrokerOptions, token: string | undefined, action: ThreadAction, params: Record<string, unknown> = {}, storePath?: string, managerDir?: string): Promise<{ allowed: true } | { allowed: false; reason: string }> {
+async function authorizeBrokerToken(options: ThreadBrokerOptions, token: string | undefined, action: ThreadAction, params: Record<string, unknown> = {}, storePath?: string, managerDir?: string): Promise<{ allowed: true; threadIds?: string[] } | { allowed: false; reason: string }> {
 	if (options.requiredToken) {
 		return token === options.requiredToken ? { allowed: true } : { allowed: false, reason: "invalid daemon capability token" };
 	}
 	const threadIds = extractScopedThreadIds(params);
-	if (threadIds.length === 0) {
-		return authorizeSecret(token, { action, cwd: typeof params.cwd === "string" ? params.cwd : undefined }, options.homeDir);
+	if (action === "supervision" && typeof params.eventId === "string") {
+		const eventThreadId = await resolveSupervisionEventThreadId(storePath, managerDir, params.eventId);
+		if (eventThreadId) threadIds.push(eventThreadId);
 	}
-	const threadCwds = await resolveThreadCwds(storePath, managerDir ?? options.managerDir, threadIds);
-	for (const threadId of threadIds) {
+	const capability = getCapabilityToken(token, options.homeDir);
+	if (threadIds.length === 0) {
+		const auth = authorizeSecret(token, { action, cwd: typeof params.cwd === "string" ? params.cwd : undefined }, options.homeDir);
+		return auth.allowed ? { allowed: true, threadIds: capability?.threadIds } : auth;
+	}
+	const uniqueThreadIds = [...new Set(threadIds)];
+	const threadCwds = await resolveThreadCwds(storePath, managerDir ?? options.managerDir, uniqueThreadIds);
+	for (const threadId of uniqueThreadIds) {
 		const auth = authorizeSecret(token, { action, threadId, cwd: threadCwds.get(threadId) }, options.homeDir);
 		if (!auth.allowed) return auth;
 	}
-	return { allowed: true };
+	return { allowed: true, threadIds: capability?.threadIds };
 }
 
 async function resolveThreadCwds(storePath: string | undefined, managerDir: string | undefined, threadIds: string[]): Promise<Map<string, string>> {
@@ -188,6 +199,15 @@ async function resolveThreadCwds(storePath: string | undefined, managerDir: stri
 		}
 	} catch {}
 	return result;
+}
+
+async function resolveSupervisionEventThreadId(storePath: string | undefined, managerDir: string | undefined, eventId: string): Promise<string | undefined> {
+	try {
+		const document = await readThreadStore(storePath, managerDir);
+		return document.supervision.pendingWakes[eventId]?.threadId ?? document.supervision.inFlightWakes[eventId]?.threadId;
+	} catch {
+		return undefined;
+	}
 }
 
 function extractScopedThreadIds(params: Record<string, unknown>): string[] {

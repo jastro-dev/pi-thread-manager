@@ -3,7 +3,7 @@ export { ThreadManagerClient } from "./broker/client.ts";
 export { startThreadBroker } from "./broker/broker.ts";
 export { attestChildState, createThreadService, ThreadService } from "./pi/lifecycle.ts";
 export { EXECUTOR_ROLE_PROMPT, injectExecutorRole } from "./pi/executor-role.ts";
-export { acknowledgeWake, claimNextWake, consumeNextWake, observeThreadTransition, recoverInFlightWakes, rejectWake, shouldArmWatcher, shouldRunTurnEndGuard, supervisionSnapshot, threadObservationKey } from "./pi/supervision.ts";
+export { acknowledgeWake, claimNextWake, consumeNextWake, observeThreadTransition, recoverExpiredInFlightWakes, recoverInFlightWakes, rejectWake, shouldArmWatcher, shouldRunTurnEndGuard, supervisionSnapshot, threadObservationKey } from "./pi/supervision.ts";
 export { SupervisionWatcher, formatWakeMessage } from "./pi/supervision-watcher.ts";
 export { createJsonlReader, PiRpcClient } from "./pi/rpc-client.ts";
 export { launchPiRpcThread, buildPiRpcArgs } from "./pi/launcher.ts";

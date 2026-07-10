@@ -31,7 +31,7 @@ import { ThreadWorktreeManager, type WorktreeCleanupResult, type WorktreeInspect
 import { ensureThreadPathsForManager } from "./session-files.ts";
 import { launchPiRpcThread, type LaunchedThreadProcess } from "./launcher.ts";
 import { injectExecutorRole } from "./executor-role.ts";
-import { acknowledgeWake, claimNextWake, consumeNextWake, observeThreadTransition, recoverInFlightWakes, rejectWake, supervisionSnapshot } from "./supervision.ts";
+import { acknowledgeWake, claimNextWake, consumeNextWake, observeThreadTransition, recoverExpiredInFlightWakes, recoverInFlightWakes, rejectWake, supervisionSnapshot } from "./supervision.ts";
 import { discoverSessionFile, readSessionTranscript, realpathCwd, type TranscriptWindow } from "./session-transcript.ts";
 import {
 	applyCreateFailed,
@@ -137,7 +137,7 @@ export class ThreadService implements BrokerRequestHandler {
 			case "list":
 				return this.listThreads(context);
 			case "create":
-				return this.createThread({ ...params, createdBy: String(params.createdBy ?? context.clientId) } as unknown as CreateThreadInput, context.requestId);
+				return this.createThread({ ...params, createdBy: String(params.createdBy ?? context.clientId), ownerSessionId: context.ownerSessionId ?? context.clientId } as unknown as CreateThreadInput, context.requestId);
 			case "read":
 				return this.readThread(validateThreadId(params.threadId), Number(params.cursor ?? 0), validateReadLimit(params.limit));
 			case "send":
@@ -162,7 +162,7 @@ export class ThreadService implements BrokerRequestHandler {
 			case "review_loop":
 				return this.createReviewLoop(params);
 			case "supervision":
-				return this.handleSupervision(String(params.operation ?? "poll"), params.eventId);
+				return this.handleSupervision(String(params.operation ?? "poll"), params.eventId, context);
 			case "handshake":
 				return this.status();
 			default: {
@@ -187,45 +187,64 @@ export class ThreadService implements BrokerRequestHandler {
 			.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 	}
 
-	async handleSupervision(operation: string, eventId?: unknown): Promise<SupervisionSnapshot | { event?: ThreadSupervisionEvent; snapshot: SupervisionSnapshot }> {
+	async handleSupervision(operation: string, eventId?: unknown, context?: BrokerRequestContext): Promise<SupervisionSnapshot | { event?: ThreadSupervisionEvent; snapshot: SupervisionSnapshot }> {
 		if (!["poll", "arm", "disarm", "dequeue", "claim", "ack", "nack"].includes(operation)) throw new Error(`Unknown supervision operation: ${operation}`);
+		const ownerSessionId = supervisionOwner(context);
+		const allowedThreadIds = context?.authorizedThreadIds ? new Set(context.authorizedThreadIds) : undefined;
 		if (operation === "poll") {
-			await this.refreshLiveThreads();
-			await this.mutate((document) => recoverInFlightWakes(document.supervision));
+			const before = await this.readSupervisionSnapshot(ownerSessionId, allowedThreadIds);
+			if (before.activeThreadCount > 0 || before.pendingWakeCount > 0 || before.inFlightWakeCount > 0 || before.armed) {
+				await this.refreshLiveThreads(ownerSessionId, allowedThreadIds);
+				await this.mutate((document) => recoverExpiredInFlightWakes(document.supervision, this.now().toISOString(), ownerSessionId, allowedThreadIds));
+			}
 		}
 		if (operation === "arm" || operation === "disarm") {
-			await this.mutate((document) => {
-				document.supervision.armed = operation === "arm";
-			});
+			const currentlyArmed = (await this.readSupervisionSnapshot(ownerSessionId, allowedThreadIds)).armed;
+			const shouldBeArmed = operation === "arm";
+			if (currentlyArmed !== shouldBeArmed) {
+				await this.mutate((document) => {
+					if (shouldBeArmed) document.supervision.armedOwners[ownerSessionId] = true;
+					else delete document.supervision.armedOwners[ownerSessionId];
+					document.supervision.armed = Object.keys(document.supervision.armedOwners).length > 0;
+				});
+			}
 		}
 		if (operation === "dequeue") {
-			const event = await this.mutate((document) => consumeNextWake(document.supervision, this.now().toISOString()));
-			return { event, snapshot: await this.readSupervisionSnapshot() };
+			const event = await this.mutate((document) => consumeNextWake(document.supervision, this.now().toISOString(), ownerSessionId, allowedThreadIds));
+			return { event, snapshot: await this.readSupervisionSnapshot(ownerSessionId, allowedThreadIds) };
 		}
 		if (operation === "claim") {
-			const event = await this.mutate((document) => claimNextWake(document.supervision));
-			return { event, snapshot: await this.readSupervisionSnapshot() };
+			const event = await this.mutate((document) => claimNextWake(document.supervision, ownerSessionId, this.now().toISOString(), undefined, allowedThreadIds));
+			return { event, snapshot: await this.readSupervisionSnapshot(ownerSessionId, allowedThreadIds) };
 		}
 		if (operation === "ack" || operation === "nack") {
 			if (typeof eventId !== "string" || eventId.length === 0) throw new Error(`${operation} requires eventId`);
-			await this.mutate((document) => operation === "ack"
-				? acknowledgeWake(document.supervision, eventId, this.now().toISOString())
-				: rejectWake(document.supervision, eventId));
-			return { snapshot: await this.readSupervisionSnapshot() };
+			await this.mutate((document) => {
+				const event = operation === "ack"
+					? acknowledgeWake(document.supervision, eventId, this.now().toISOString(), ownerSessionId)
+					: rejectWake(document.supervision, eventId, ownerSessionId);
+				if (!event && (document.supervision.inFlightWakes[eventId]?.ownerSessionId ?? ownerSessionId) !== ownerSessionId) throw new Error(`supervision wake ${eventId} is owned by another parent session`);
+				if (allowedThreadIds && document.supervision.inFlightWakes[eventId] && !allowedThreadIds.has(document.supervision.inFlightWakes[eventId].threadId)) throw new Error(`supervision wake ${eventId} is outside the capability token scope`);
+			});
+			return { snapshot: await this.readSupervisionSnapshot(ownerSessionId, allowedThreadIds) };
 		}
-		return await this.readSupervisionSnapshot();
+		return await this.readSupervisionSnapshot(ownerSessionId, allowedThreadIds);
 	}
 
-	private async readSupervisionSnapshot(): Promise<SupervisionSnapshot> {
+	private async readSupervisionSnapshot(ownerSessionId = "legacy", allowedThreadIds?: ReadonlySet<string>): Promise<SupervisionSnapshot> {
 		const document = await readThreadStore(this.statePath, this.managerDir);
-		const activeThreadCount = Object.values(document.threads).filter((thread) => ["creating", "starting", "idle", "running", "stopping", "approval_blocked"].includes(thread.status)).length;
-		return supervisionSnapshot(document.supervision, activeThreadCount);
+		const activeThreadCount = Object.values(document.threads).filter((thread) => thread.ownerSessionId === ownerSessionId && (!allowedThreadIds || allowedThreadIds.has(thread.id)) && ["creating", "starting", "idle", "running", "stopping", "approval_blocked"].includes(thread.status)).length;
+		return supervisionSnapshot(document.supervision, activeThreadCount, ownerSessionId, allowedThreadIds);
 	}
 
-	private async observeSupervision(): Promise<void> {
+	private async observeSupervision(ownerSessionId?: string, allowedThreadIds?: ReadonlySet<string>): Promise<void> {
 		const now = this.now().toISOString();
 		await this.mutate((document) => {
-			for (const thread of Object.values(document.threads)) observeThreadTransition(document.supervision, thread, now);
+			for (const thread of Object.values(document.threads)) {
+				if (ownerSessionId !== undefined && thread.ownerSessionId !== ownerSessionId) continue;
+				if (allowedThreadIds && !allowedThreadIds.has(thread.id)) continue;
+				observeThreadTransition(document.supervision, thread, now, ownerSessionId ?? thread.ownerSessionId ?? "legacy");
+			}
 		});
 	}
 
@@ -288,6 +307,7 @@ export class ThreadService implements BrokerRequestHandler {
 			createdAt: now,
 			updatedAt: now,
 			createdBy: input.createdBy,
+			ownerSessionId: input.ownerSessionId ?? "legacy",
 			launchNonce: this.randomId(),
 			restartCount: 0,
 			sessionFile: path.join(paths.sessionDir, "session.jsonl"),
@@ -541,8 +561,9 @@ export class ThreadService implements BrokerRequestHandler {
 	}
 
 	async reconcileAfterRestart(): Promise<void> {
+		await this.mutate((document) => recoverInFlightWakes(document.supervision));
 		await this.scheduler.reconcileAfterRestart();
-		const inspections = await this.inspectStoredIsolatedWorktrees(["creating", "starting", "idle", "running", "stopping", "crashed"]);
+		const inspections = await this.inspectStoredIsolatedWorktrees(["creating", "starting", "idle", "running", "stopping", "crashed", "approval_blocked"]);
 		const resumable: ManagedThread[] = [];
 		await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
 			for (const thread of Object.values(document.threads)) {
@@ -564,6 +585,10 @@ export class ThreadService implements BrokerRequestHandler {
 						continue;
 					}
 					markThreadOrphanAfterRestart(document, thread, this.now().toISOString(), inspection.reason);
+					continue;
+				}
+				if (thread.status === "approval_blocked" && !this.handles.has(thread.id)) {
+					markThreadOrphanAfterRestart(document, thread, this.now().toISOString(), "approval-blocked thread has no reconnectable RPC handle after daemon restart");
 					continue;
 				}
 				if (thread.status === "creating" && !this.handles.has(thread.id)) {
@@ -804,9 +829,14 @@ export class ThreadService implements BrokerRequestHandler {
 		return document.threads[operation.threadId];
 	}
 
-	private async refreshLiveThreads(): Promise<void> {
-		for (const threadId of this.handles.keys()) await this.refreshThreadState(threadId);
-		await this.observeSupervision();
+	private async refreshLiveThreads(ownerSessionId?: string, allowedThreadIds?: ReadonlySet<string>): Promise<void> {
+		const document = ownerSessionId === undefined ? undefined : await readThreadStore(this.statePath, this.managerDir);
+		for (const threadId of this.handles.keys()) {
+			if (ownerSessionId !== undefined && document?.threads[threadId]?.ownerSessionId !== ownerSessionId) continue;
+			if (allowedThreadIds && !allowedThreadIds.has(threadId)) continue;
+			await this.refreshThreadState(threadId);
+		}
+		await this.observeSupervision(ownerSessionId, allowedThreadIds);
 	}
 
 	private async refreshThreadState(threadId: string): Promise<void> {
@@ -1200,6 +1230,10 @@ async function stopLaunchedThread(handle: LaunchedThreadProcess, reason: unknown
 	if (!handle.child) return;
 	handle.child.kill("SIGTERM");
 	await waitForChildExit(handle.child, 2000);
+}
+
+function supervisionOwner(context?: BrokerRequestContext): string {
+	return context?.ownerSessionId ?? (context ? `client:${context.clientId}` : "legacy");
 }
 
 export function createThreadService(deps: ThreadServiceDeps = {}): ThreadService {

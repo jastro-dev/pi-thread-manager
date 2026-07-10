@@ -13,7 +13,7 @@ import type { ManagedThread, ThreadOperation } from "../src/types.ts";
 test("reads missing store as an empty versioned document", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-store-"));
 	const store = await readThreadStore(getThreadStorePath(root), getThreadManagerDir(root));
-	assert.equal(store.storeVersion, 3);
+	assert.equal(store.storeVersion, 4);
 	assert.deepEqual(store.threads, {});
 });
 
@@ -57,7 +57,7 @@ test("safe read treats future store versions as read-only without renaming prima
 	assert.equal(await fs.readFile(statePath, "utf8"), futureStore);
 });
 
-test("migrates v1 shared-cwd threads to v3 supervision metadata", async () => {
+test("migrates v1 shared-cwd threads to v4 owner-scoped supervision metadata", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-store-"));
 	const managerDir = getThreadManagerDir(root);
 	const statePath = getThreadStorePath(root);
@@ -70,12 +70,35 @@ test("migrates v1 shared-cwd threads to v3 supervision metadata", async () => {
 	await fs.mkdir(path.dirname(statePath), { recursive: true });
 	await fs.writeFile(statePath, `${JSON.stringify(v1)}\n`, "utf8");
 	const migrated = await readThreadStore(statePath, managerDir);
-	assert.equal(migrated.storeVersion, 3);
+	assert.equal(migrated.storeVersion, 4);
 	assert.deepEqual(migrated.jobRuns, {});
 	assert.deepEqual(migrated.commitPushDeliveries, {});
 	assert.deepEqual(migrated.threads["thread-1"].worktree, { mode: "legacy_shared_cwd", sourceCwd: managerDir, cleanupState: "not_applicable" });
-	assert.deepEqual(migrated.supervision, { armed: false, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} });
-	assert.deepEqual(migrated.migrationHistory, ["v1_to_v2_thread_worktree_metadata", "v2_to_v3_supervision_state"]);
+	assert.deepEqual(migrated.supervision, { armed: false, armedOwners: {}, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} });
+	assert.deepEqual(migrated.migrationHistory, ["v1_to_v2_thread_worktree_metadata", "v2_to_v3_supervision_state", "v3_to_v4_owner_scoped_supervision"]);
+});
+
+test("drops unowned v3 supervision wakes during safe migration", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-store-"));
+	const managerDir = getThreadManagerDir(root);
+	const statePath = getThreadStorePath(root);
+	const legacy = createEmptyThreadStore(new Date("2026-01-01T00:00:00.000Z")) as unknown as Record<string, unknown>;
+	legacy.storeVersion = 3;
+	legacy.supervision = {
+		armed: true,
+		lastSeen: { "thread-1": "old" },
+		pendingWakes: { "wake-old": { id: "wake-old", threadId: "thread-1", status: "idle", createdAt: "2026-01-01T00:00:00.000Z" } },
+		inFlightWakes: {},
+		consumedEventIds: {},
+	};
+	(legacy.threads as Record<string, ManagedThread>)["thread-1"] = createThread("thread-1", managerDir, "idle");
+	await fs.mkdir(path.dirname(statePath), { recursive: true });
+	await fs.writeFile(statePath, `${JSON.stringify(legacy)}\n`, "utf8");
+	const migrated = await readThreadStore(statePath, managerDir);
+	assert.deepEqual(migrated.supervision.pendingWakes, {});
+	assert.deepEqual(migrated.supervision.inFlightWakes, {});
+	assert.equal(migrated.supervision.armed, false);
+	assert.equal(migrated.supervision.lastSeen["thread-1"], undefined);
 });
 
 test("removes stale lock only when owning pid is dead", async () => {

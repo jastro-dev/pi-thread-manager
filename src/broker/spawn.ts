@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { isProviderCredentialEnvKey } from "../provider-env.ts";
+import { ThreadManagerClient } from "./client.ts";
 import { getBrokerPidPath, getBrokerSocketPath, getBrokerSpawnLockPath, getThreadManagerDir } from "./paths.ts";
 
 type BrokerLaunchSpec =
@@ -56,24 +57,48 @@ export function getBrokerLaunchSpec(
 	return { kind: "direct", command: nodePath, args: [getTsxCliPath(extensionDir), brokerPath] };
 }
 
-export async function spawnBrokerIfNeeded(options: { homeDir?: string; platform?: NodeJS.Platform; extensionDir?: string; timeoutMs?: number } = {}): Promise<void> {
+export interface BrokerSpawnOptions {
+	homeDir?: string;
+	platform?: NodeJS.Platform;
+	extensionDir?: string;
+	timeoutMs?: number;
+	probeBroker?: () => Promise<BrokerProbeResult>;
+	replaceIncompatibleBroker?: () => Promise<void>;
+	launchBroker?: () => Promise<void>;
+}
+
+export type BrokerProbeResult = "absent" | "compatible" | "incompatible";
+
+export async function spawnBrokerIfNeeded(options: BrokerSpawnOptions = {}): Promise<void> {
 	const homeDir = options.homeDir;
 	const platform = options.platform ?? process.platform;
 	const managerDir = getThreadManagerDir(homeDir);
 	mkdirSync(managerDir, { recursive: true, mode: 0o700 });
-	if (await isBrokerRunning(homeDir, platform)) return;
-	if (!acquireSpawnLock(getBrokerSpawnLockPath(homeDir))) {
-		await waitForBroker(homeDir, platform, options.timeoutMs);
-		return;
-	}
-	try {
-		if (await isBrokerRunning(homeDir, platform)) return;
+	const probe = options.probeBroker ?? (() => probeBrokerProtocol(homeDir, platform));
+	const replace = options.replaceIncompatibleBroker ?? (() => replaceIncompatibleBrokerProcess(homeDir, platform, options.timeoutMs));
+	const launchBroker = options.launchBroker ?? (async () => {
 		const brokerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "broker.ts");
 		const launch = getBrokerLaunchSpec(brokerPath, platform, options.extensionDir, managerDir);
 		if (launch.kind === "windows-launcher") writeFileSync(launch.launcherPath, getWindowsHiddenLauncherScript(launch.launcherCommandLine), "utf8");
 		const child = spawn(launch.command, launch.args, { cwd: options.extensionDir ?? EXTENSION_DIR, detached: true, stdio: "ignore", windowsHide: true, env: buildBrokerEnv(process.env, homeDir) });
 		child.unref();
 		await waitForBroker(homeDir, platform, options.timeoutMs);
+	});
+
+	const ensure = async (): Promise<boolean> => {
+		const result = await probe();
+		if (result === "compatible") return true;
+		if (result === "incompatible") await replace();
+		return false;
+	};
+	if (await ensure()) return;
+	if (!acquireSpawnLock(getBrokerSpawnLockPath(homeDir))) {
+		await waitForBroker(homeDir, platform, options.timeoutMs);
+		return;
+	}
+	try {
+		if (await ensure()) return;
+		await launchBroker();
 	} finally {
 		releaseSpawnLock(getBrokerSpawnLockPath(homeDir));
 	}
@@ -91,6 +116,42 @@ export async function isBrokerRunning(homeDir?: string, platform: NodeJS.Platfor
 	} catch {
 		return false;
 	}
+}
+
+async function probeBrokerProtocol(homeDir?: string, platform: NodeJS.Platform = process.platform): Promise<BrokerProbeResult> {
+	if (!(await isBrokerRunning(homeDir, platform))) return "absent";
+	const client = new ThreadManagerClient({ homeDir, platform, requestTimeoutMs: 1000 });
+	try {
+		await client.connect();
+		client.disconnect();
+		return "compatible";
+	} catch (error) {
+		client.disconnect();
+		if (error instanceof Error && /unsupported protocol version/.test(error.message)) return "incompatible";
+		throw error;
+	}
+}
+
+async function replaceIncompatibleBrokerProcess(homeDir?: string, platform: NodeJS.Platform = process.platform, timeoutMs = 5000): Promise<void> {
+	const pidPath = getBrokerPidPath(homeDir);
+	let pid: number;
+	try {
+		pid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+	} catch (error) {
+		throw new Error(`Cannot replace incompatible broker without a readable pid file: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) throw new Error(`Refusing to replace incompatible broker with unsafe pid ${String(pid)}`);
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+	}
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < timeoutMs) {
+		if (!(await isBrokerRunning(homeDir, platform))) return;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	throw new Error(`Incompatible broker process ${pid} did not stop within ${timeoutMs}ms`);
 }
 
 async function waitForBroker(homeDir?: string, platform: NodeJS.Platform = process.platform, timeoutMs = 5000): Promise<void> {
