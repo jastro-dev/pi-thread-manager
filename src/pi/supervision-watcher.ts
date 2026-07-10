@@ -41,15 +41,7 @@ export class SupervisionWatcher {
 		this.started = true;
 		const needed = await this.runOnce();
 		if (!this.started || !needed) return;
-		this.timer = setInterval(() => {
-			void this.runOnce().then((stillNeeded) => {
-				if (!stillNeeded && this.timer) {
-					clearInterval(this.timer);
-					this.timer = undefined;
-				}
-			});
-		}, this.intervalMs);
-		this.timer.unref?.();
+		this.ensureTimer();
 	}
 
 	async stop(): Promise<void> {
@@ -90,7 +82,7 @@ export class SupervisionWatcher {
 	}
 
 	async runTurnEndGuard(): Promise<void> {
-		await this.runOnce(true);
+		if (await this.runOnce(true)) this.ensureTimer();
 	}
 
 	private async cycle(guardOnly: boolean): Promise<boolean> {
@@ -99,7 +91,14 @@ export class SupervisionWatcher {
 		try {
 			await client.connect();
 			let snapshot = await client.request<SupervisionSnapshot>("supervision", this.ownerParams({ operation: "poll" }));
-			if (guardOnly && !shouldRunTurnEndGuard(snapshot)) return false;
+			if (guardOnly) {
+				if (!shouldRunTurnEndGuard(snapshot)) return false;
+				if (shouldArmWatcher(snapshot)) {
+					if (!snapshot.armed) snapshot = await client.request<SupervisionSnapshot>("supervision", this.ownerParams({ operation: "arm" }));
+					return shouldArmWatcher(snapshot);
+				}
+				return true;
+			}
 
 			if (snapshot.pendingWakeCount > 0) {
 				snapshot = await this.drainPendingWakes(client, snapshot);
@@ -113,6 +112,19 @@ export class SupervisionWatcher {
 		} finally {
 			client.disconnect?.();
 		}
+	}
+
+	private ensureTimer(): void {
+		if (!this.started || this.timer) return;
+		this.timer = setInterval(() => {
+			void this.runOnce().then((stillNeeded) => {
+				if (!stillNeeded && this.timer) {
+					clearInterval(this.timer);
+					this.timer = undefined;
+				}
+			});
+		}, this.intervalMs);
+		this.timer.unref?.();
 	}
 
 	private async drainPendingWakes(client: SupervisionClientPort, initialSnapshot: SupervisionSnapshot): Promise<SupervisionSnapshot> {

@@ -127,6 +127,27 @@ test("watcher notifies once and acknowledges only after delivery", async () => {
 	assert.ok(client.calls.includes("ack"));
 });
 
+test("turn-end guard arms without waiting for wake delivery", async () => {
+	const state = createState();
+	observeThreadTransition(state, createThread({ status: "idle" }), now);
+	const client = new FakeSupervisionClient(state);
+	const watcher = new SupervisionWatcher({
+		spawnBroker: async () => undefined,
+		createClient: () => client,
+		sendUserMessage: () => undefined,
+		waitForDelivery: async () => { throw new Error("turn-end guard must not wait for delivery"); },
+		intervalMs: 1000,
+	});
+
+	await Promise.race([
+		watcher.runTurnEndGuard(),
+		new Promise<never>((_, reject) => setTimeout(() => reject(new Error("turn-end guard waited for wake delivery")), 100)),
+	]);
+	assert.equal(client.calls.includes("claim"), false);
+	assert.equal(state.armedOwners.legacy, true);
+	await watcher.stop();
+});
+
 test("watcher requeues a wake when parent delivery fails", async () => {
 	const state = createState();
 	observeThreadTransition(state, createThread({ status: "failed", lastError: "boom" }), now);
