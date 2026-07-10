@@ -106,7 +106,7 @@ test("rejected wake is requeued and turn-end guard only runs when needed", () =>
 	assert.equal(shouldRunTurnEndGuard({ armed: true, activeThreadCount: 0, pendingWakeCount: 1, inFlightWakeCount: 0 }), true);
 });
 
-test("watcher notifies once and acknowledges only after delivery", async () => {
+test("watcher notifies once and acknowledges after queue acceptance", async () => {
 	const state = createState();
 	observeThreadTransition(state, createThread({ status: "idle" }), now);
 	const client = new FakeSupervisionClient(state);
@@ -148,7 +148,7 @@ test("turn-end guard arms without waiting for wake delivery", async () => {
 	await watcher.stop();
 });
 
-test("watcher requeues a wake when parent delivery fails", async () => {
+test("watcher requeues a wake when queueing the parent message fails", async () => {
 	const state = createState();
 	observeThreadTransition(state, createThread({ status: "failed", lastError: "boom" }), now);
 	const client = new FakeSupervisionClient(state);
@@ -156,8 +156,8 @@ test("watcher requeues a wake when parent delivery fails", async () => {
 	const watcher = new SupervisionWatcher({
 		spawnBroker: async () => undefined,
 		createClient: () => client,
-		sendUserMessage: () => { attempts += 1; },
-		waitForDelivery: async () => {
+		sendUserMessage: () => {
+			attempts += 1;
 			if (attempts === 1) throw new Error("parent unavailable");
 		},
 	});
@@ -169,6 +169,47 @@ test("watcher requeues a wake when parent delivery fails", async () => {
 	assert.equal(attempts, 2);
 	assert.equal(Object.keys(state.pendingWakes).length, 0);
 	assert.equal(Object.keys(state.consumedEventIds).length, 1);
+});
+
+test("watcher acknowledges an accepted streaming follow-up without waiting for message_start", async () => {
+	const state = createState();
+	observeThreadTransition(state, createThread({ status: "idle" }), now);
+	const client = new FakeSupervisionClient(state);
+	const watcher = new SupervisionWatcher({
+		spawnBroker: async () => undefined,
+		createClient: () => client,
+		sendUserMessage: () => undefined,
+		waitForDelivery: async () => { throw new Error("message_start is not queue acknowledgement"); },
+	});
+
+	await watcher.runOnce();
+	assert.equal(Object.keys(state.pendingWakes).length, 0);
+	assert.equal(Object.keys(state.inFlightWakes).length, 0);
+	assert.equal(Object.keys(state.consumedEventIds).length, 1);
+	assert.equal(client.calls.includes("nack"), false);
+});
+
+test("streaming wake and concurrent turn_end deliver exactly once", async () => {
+	const state = createState();
+	observeThreadTransition(state, createThread({ status: "idle" }), now);
+	const client = new FakeSupervisionClient(state);
+	let deliveries = 0;
+	let turnEnd: Promise<void> | undefined;
+	let watcher!: SupervisionWatcher;
+	watcher = new SupervisionWatcher({
+		spawnBroker: async () => undefined,
+		createClient: () => client,
+		sendUserMessage: () => {
+			deliveries += 1;
+			turnEnd = watcher.runTurnEndGuard();
+		},
+	});
+
+	await watcher.runOnce();
+	await turnEnd;
+	assert.equal(deliveries, 1);
+	assert.equal(Object.keys(state.consumedEventIds).length, 1);
+	assert.equal(client.calls.filter((call) => call === "nack").length, 0);
 });
 
 class FakeSupervisionClient {

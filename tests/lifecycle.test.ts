@@ -431,6 +431,27 @@ test("read marks thread crashed when get_messages fails", async () => {
 	assert.match(store.threads[thread.id].lastError ?? "", /messages broken/);
 });
 
+test("read failure preserves approval_blocked before restart stop recovery", async () => {
+	const { service, statePath, managerDir, rpc } = await createService();
+	const thread = await service.createThread({ cwd: managerDir, createdBy: "test", safetyPolicy: sharedSafetyPolicy() });
+	await mutateThreadStore({ statePath, managerDir }, (document) => {
+		document.threads[thread.id].status = "approval_blocked";
+		document.threads[thread.id].lastError = "manual approval required";
+	});
+	rpc.failMessages = new Error("messages unavailable");
+	await service.readThread(thread.id, 0, 10);
+	let store = await readThreadStore(statePath, managerDir);
+	assert.equal(store.threads[thread.id].status, "approval_blocked");
+
+	const restarted = new ThreadService({ statePath, managerDir, randomId: () => "restart" });
+	await restarted.reconcileAfterRestart();
+	store = await readThreadStore(statePath, managerDir);
+	assert.equal(store.threads[thread.id].status, "orphan_needs_manual_action");
+	const stop = await restarted.stopThread(thread.id);
+	assert.equal(stop.status, "completed");
+	assert.equal((await readThreadStore(statePath, managerDir)).threads[thread.id].status, "stopped");
+});
+
 test("idle refresh clears terminal current operation", async () => {
 	const { service, statePath, managerDir, rpc } = await createService();
 	const thread = await service.createThread({ cwd: managerDir, createdBy: "test", safetyPolicy: sharedSafetyPolicy() });
@@ -460,13 +481,34 @@ test("idle refresh does not complete undispatched current operation", async () =
 	assert.equal(store.threads[thread.id].currentOperationId, "op-undispatched");
 });
 
-test("idle unarmed supervision poll does not rewrite the store", async () => {
-	const { service, statePath, managerDir } = await createService();
-	await service.status();
+test("no-op supervision poll does not rewrite active observation state", async () => {
+	const { service, statePath, managerDir, rpc } = await createService();
+	await service.createThread({ cwd: managerDir, createdBy: "test", ownerSessionId: "parent", safetyPolicy: sharedSafetyPolicy() });
+	await service.handleSupervision("dequeue", undefined, { clientId: "client", ownerSessionId: "parent" });
+	rpc.state = { isStreaming: false, pendingMessageCount: 0 };
 	const before = await readThreadStore(statePath, managerDir);
+	const beforeStat = await fs.stat(statePath);
 	await service.handleSupervision("poll", undefined, { clientId: "client", ownerSessionId: "parent" });
 	const after = await readThreadStore(statePath, managerDir);
+	const afterStat = await fs.stat(statePath);
 	assert.equal(after.updatedAt, before.updatedAt);
+	assert.equal(afterStat.mtimeMs, beforeStat.mtimeMs);
+});
+
+test("supervision poll persists a real child completion transition", async () => {
+	let clock = new Date("2026-01-01T00:00:00.000Z");
+	const { service, statePath, managerDir, rpc } = await createService({ now: () => clock });
+	const thread = await service.createThread({ cwd: managerDir, createdBy: "test", safetyPolicy: sharedSafetyPolicy() });
+	await service.handleSupervision("dequeue");
+	await service.sendToThread(thread.id, "send", "work");
+	const before = await readThreadStore(statePath, managerDir);
+	clock = new Date("2026-01-01T00:00:01.000Z");
+	rpc.state = { isStreaming: false, pendingMessageCount: 0 };
+	const snapshot = await service.handleSupervision("poll") as { pendingWakeCount: number };
+	const after = await readThreadStore(statePath, managerDir);
+	assert.equal(snapshot.pendingWakeCount, 1);
+	assert.notEqual(after.updatedAt, before.updatedAt);
+	assert.equal(after.threads[thread.id].status, "idle");
 });
 
 test("reconcile refuses PID-only adoption after daemon restart", async () => {

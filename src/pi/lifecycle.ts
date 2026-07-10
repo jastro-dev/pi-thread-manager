@@ -421,7 +421,9 @@ export class ThreadService implements BrokerRequestHandler {
 			} catch (error) {
 				this.handles.delete(threadId);
 				handle.rpc.destroy(error instanceof Error ? error : new Error(String(error)));
-				await this.markThreadCrashedAfterReadFailure(threadId, error);
+				await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
+					applyThreadCrashedAfterReadFailure(document, threadId, error, this.now);
+				});
 				transcriptWindow = thread.sessionFile ? await readSessionTranscript(thread.sessionFile, cursor, limit) : undefined;
 			}
 		} else if (thread.sessionFile) {
@@ -849,16 +851,7 @@ export class ThreadService implements BrokerRequestHandler {
 			this.handles.delete(threadId);
 			handle.rpc.destroy(error instanceof Error ? error : new Error(String(error)));
 			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-				const thread = document.threads[threadId];
-				if (!thread || thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "approval_blocked") return;
-				thread.status = "crashed";
-				thread.lastError = error instanceof Error ? error.message : String(error);
-				thread.updatedAt = this.now().toISOString();
-				if (thread.currentOperationId && document.operations[thread.currentOperationId] && !isTerminalOperation(document.operations[thread.currentOperationId].status)) {
-					document.operations[thread.currentOperationId].status = "unknown_after_restart";
-					document.operations[thread.currentOperationId].recoveryAction = "manual";
-					document.operations[thread.currentOperationId].updatedAt = this.now().toISOString();
-				}
+				applyThreadCrashedAfterReadFailure(document, threadId, error, this.now);
 			});
 			return;
 		}
@@ -869,13 +862,18 @@ export class ThreadService implements BrokerRequestHandler {
 			const busy = state.isStreaming || (state.pendingMessageCount ?? 0) > 0;
 			const currentOperation = thread.currentOperationId ? document.operations[thread.currentOperationId] : undefined;
 			const undispatchedCurrentOperation = currentOperation && !isTerminalOperation(currentOperation.status) && currentOperation.status !== "acknowledged";
-			thread.status = busy || undispatchedCurrentOperation ? "running" : "idle";
-			thread.updatedAt = this.now().toISOString();
+			const nextStatus = busy || undispatchedCurrentOperation ? "running" : "idle";
+			let changed = false;
+			if (thread.status !== nextStatus) {
+				thread.status = nextStatus;
+				changed = true;
+			}
 			if (!busy) {
 				for (const operation of Object.values(document.operations)) {
 					if (operation.threadId === threadId && operation.kind === "follow_up" && operation.status === "acknowledged") {
 						operation.status = "completed";
 						operation.updatedAt = this.now().toISOString();
+						changed = true;
 					}
 				}
 			}
@@ -885,10 +883,13 @@ export class ThreadService implements BrokerRequestHandler {
 					operation.status = "completed";
 					operation.updatedAt = this.now().toISOString();
 					thread.currentOperationId = undefined;
+					changed = true;
 				} else if (isTerminalOperation(operation.status)) {
 					thread.currentOperationId = undefined;
+					changed = true;
 				}
 			}
+			if (changed) thread.updatedAt = this.now().toISOString();
 		});
 	}
 
@@ -1036,21 +1037,6 @@ export class ThreadService implements BrokerRequestHandler {
 			document.operations[operationId].error = "No live RPC handle for thread";
 			document.threads[threadId].status = "orphan_needs_manual_action";
 			document.threads[threadId].lastError = "No live RPC handle for thread";
-		});
-	}
-
-	private async markThreadCrashedAfterReadFailure(threadId: string, error: unknown): Promise<void> {
-		await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
-			const thread = document.threads[threadId];
-			if (!thread || thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "orphan_needs_manual_action") return;
-			thread.status = "crashed";
-			thread.lastError = error instanceof Error ? error.message : String(error);
-			thread.updatedAt = this.now().toISOString();
-			if (thread.currentOperationId && document.operations[thread.currentOperationId] && !isTerminalOperation(document.operations[thread.currentOperationId].status)) {
-				document.operations[thread.currentOperationId].status = "unknown_after_restart";
-				document.operations[thread.currentOperationId].recoveryAction = "manual";
-				document.operations[thread.currentOperationId].updatedAt = this.now().toISOString();
-			}
 		});
 	}
 

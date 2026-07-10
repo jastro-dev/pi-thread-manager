@@ -12,6 +12,7 @@ import { getBrokerPidPath, getBrokerSocketPath, getThreadManagerDir, getThreadSt
 import { buildBrokerEnv, getBrokerLaunchSpec, spawnBrokerIfNeeded } from "../src/broker/spawn.ts";
 import { startThreadBroker, type BrokerRequestHandler } from "../src/broker/broker.ts";
 import { normalizeSafetyPolicy } from "../src/protocol.ts";
+import { ThreadService } from "../src/pi/lifecycle.ts";
 import { createEmptyThreadStore, writeThreadStore } from "../src/store/thread-store.ts";
 import { PROTOCOL_VERSION } from "../src/types.ts";
 
@@ -253,6 +254,54 @@ test("broker validates scoped token against every requested thread id", async ()
 		const client = new ThreadManagerClient({ socketPath, homeDir: root, token: "scoped-secret", requestTimeoutMs: 500 });
 		await client.connect();
 		await assert.rejects(() => client.request("schedule", { threadIds: ["thread-1", "thread-2"] }, "sched-1"), /not scoped/);
+		client.disconnect();
+	} finally {
+		await broker.close();
+	}
+});
+
+test("broker scopes supervision poll and claim to cwd capability roots", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-broker-supervision-cwd-auth-"));
+	const allowedRoot = path.join(root, "allowed");
+	const disallowedRoot = path.join(root, "disallowed");
+	await fs.mkdir(allowedRoot, { recursive: true });
+	await fs.mkdir(disallowedRoot, { recursive: true });
+	const managerDir = getThreadManagerDir(root);
+	const statePath = getThreadStorePath(root);
+	const auth = loadOrCreateAuthRoot(root);
+	auth.tokens.push({ id: "supervision-cwd-scoped", secret: "supervision-cwd-secret", clientId: "client", actions: ["handshake", "supervision"], cwdRoots: [allowedRoot] });
+	await fs.writeFile(path.join(managerDir, "auth-root.json"), `${JSON.stringify(auth)}\n`);
+	const document = createEmptyThreadStore(new Date("2026-01-01T00:00:00.000Z"));
+	for (const [threadId, cwd] of [["thread-allowed", allowedRoot], ["thread-disallowed", disallowedRoot]] as const) {
+		document.threads[threadId] = {
+			id: threadId,
+			status: "idle",
+			cwd,
+			tags: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			createdBy: "test",
+			ownerSessionId: "parent",
+			launchProfile: { cwd, extensionLoading: "inherit", approvalMode: "ask", inheritedFromParent: true },
+			safetyPolicy: normalizeSafetyPolicy(),
+			worktree: { mode: "legacy_shared_cwd", sourceCwd: cwd, cleanupState: "not_applicable" },
+		};
+	}
+	document.supervision.lastSeen["thread-allowed"] = JSON.stringify({ status: "idle" });
+	document.supervision.lastSeen["thread-disallowed"] = JSON.stringify({ status: "idle" });
+	document.supervision.pendingWakes["wake-allowed"] = { id: "wake-allowed", threadId: "thread-allowed", ownerSessionId: "parent", status: "idle", createdAt: "2026-01-01T00:00:00.000Z" };
+	document.supervision.pendingWakes["wake-disallowed"] = { id: "wake-disallowed", threadId: "thread-disallowed", ownerSessionId: "parent", status: "idle", createdAt: "2026-01-01T00:00:01.000Z" };
+	await writeThreadStore(statePath, document);
+	const broker = await startThreadBroker({ socketPath: testSocketPath(root), pidPath: getBrokerPidPath(root), managerDir, storePath: statePath, platform: process.platform, homeDir: root, handler: new ThreadService({ statePath, managerDir, homeDir: root }) });
+	try {
+		const client = new ThreadManagerClient({ socketPath: testSocketPath(root), homeDir: root, token: "supervision-cwd-secret", requestTimeoutMs: 500 });
+		await client.connect();
+		const polled = await client.request<{ pendingWakeCount: number }>("supervision", { operation: "poll", ownerSessionId: "parent" }, "poll-cwd");
+		assert.equal(polled.pendingWakeCount, 1);
+		await assert.rejects(() => client.request("supervision", { operation: "ack", eventId: "wake-disallowed", ownerSessionId: "parent" }, "ack-disallowed"), /not scoped/);
+		const claimed = await client.request<{ event: { threadId: string } }>("supervision", { operation: "claim", ownerSessionId: "parent" }, "claim-cwd");
+		assert.equal(claimed.event.threadId, "thread-allowed");
+		await client.request("supervision", { operation: "ack", eventId: "wake-allowed", ownerSessionId: "parent" }, "ack-allowed");
 		client.disconnect();
 	} finally {
 		await broker.close();

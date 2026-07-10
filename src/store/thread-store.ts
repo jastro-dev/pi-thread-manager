@@ -100,15 +100,28 @@ export async function mutateThreadStore<T>(
 	await fs.mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
 	const release = await acquireFileLock(`${statePath}.lock`, options);
 	try {
+		let stateExists = true;
+		try {
+			await fs.access(statePath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			stateExists = false;
+		}
 		const document = await readThreadStore(statePath, managerDir);
 		if (document.pausedReason && !options.allowPausedMutation) {
 			throw new Error(`Thread manager store is paused: ${document.pausedReason}`);
 		}
+		const before = JSON.stringify(document);
 		const result = await mutator(document);
-		document.updatedAt = (options.now?.() ?? new Date()).toISOString();
-		assertThreadStoreInvariants(document, managerDir);
-		await writeThreadStore(statePath, document);
-		await writeThreadStore(path.join(managerDir, "threads.last-good.json"), document).catch(() => undefined);
+		const changed = JSON.stringify(document) !== before;
+		if (stateExists ? changed : true) {
+			if (changed) document.updatedAt = (options.now?.() ?? new Date()).toISOString();
+			assertThreadStoreInvariants(document, managerDir);
+			await writeThreadStore(statePath, document);
+			await writeThreadStore(path.join(managerDir, "threads.last-good.json"), document).catch(() => undefined);
+		} else {
+			assertThreadStoreInvariants(document, managerDir);
+		}
 		return result;
 	} finally {
 		await release();

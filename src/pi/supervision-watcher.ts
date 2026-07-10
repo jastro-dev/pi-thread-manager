@@ -10,8 +10,9 @@ export interface SupervisionClientPort {
 export interface SupervisionWatcherDeps {
 	spawnBroker: () => Promise<void>;
 	createClient: () => SupervisionClientPort;
-	sendUserMessage: (content: string, options?: { deliverAs?: "followUp" }) => void;
-	waitForDelivery: (content: string) => Promise<void>;
+	sendUserMessage: (content: string, options?: { deliverAs?: "followUp" }) => void | Promise<void>;
+	/** @deprecated Queue acceptance is acknowledged by sendUserMessage returning. */
+	waitForDelivery?: (content: string) => Promise<void>;
 	intervalMs?: number;
 	onError?: (error: unknown) => void;
 	ownerSessionId?: string;
@@ -37,7 +38,7 @@ export class SupervisionWatcher {
 	}
 
 	async start(): Promise<void> {
-		if (this.started) return;
+		if (this.started && this.timer) return;
 		this.started = true;
 		const needed = await this.runOnce();
 		if (!this.started || !needed) return;
@@ -134,8 +135,7 @@ export class SupervisionWatcher {
 			if (!result.event) return result.snapshot;
 			try {
 				const message = formatWakeMessage(result.event);
-				this.deps.sendUserMessage(message, { deliverAs: "followUp" });
-				await this.deps.waitForDelivery(message);
+				await this.deps.sendUserMessage(message, { deliverAs: "followUp" });
 				const acknowledged = await client.request<{ snapshot: SupervisionSnapshot }>("supervision", this.ownerParams({ operation: "ack", eventId: result.event.id }));
 				snapshot = acknowledged.snapshot;
 			} catch (error) {

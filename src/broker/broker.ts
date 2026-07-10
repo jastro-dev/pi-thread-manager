@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
-import { validateBrokerRequest } from "../protocol.ts";
+import { isPathInside, validateBrokerRequest } from "../protocol.ts";
 import { PROTOCOL_VERSION, type BrokerRequest, type BrokerResponse, type DaemonStatus, type ProtocolLimits, type ThreadAction } from "../types.ts";
 import { readThreadStore } from "../store/thread-store.ts";
 import { createThreadService } from "../pi/lifecycle.ts";
@@ -177,7 +177,8 @@ async function authorizeBrokerToken(options: ThreadBrokerOptions, token: string 
 	const capability = getCapabilityToken(token, options.homeDir);
 	if (threadIds.length === 0) {
 		const auth = authorizeSecret(token, { action, cwd: typeof params.cwd === "string" ? params.cwd : undefined }, options.homeDir);
-		return auth.allowed ? { allowed: true, threadIds: capability?.threadIds } : auth;
+		if (!auth.allowed) return auth;
+		return { allowed: true, threadIds: action === "supervision" ? await resolveSupervisionThreadIds(storePath, managerDir ?? options.managerDir, capability) : capability?.threadIds };
 	}
 	const uniqueThreadIds = [...new Set(threadIds)];
 	const threadCwds = await resolveThreadCwds(storePath, managerDir ?? options.managerDir, uniqueThreadIds);
@@ -185,7 +186,24 @@ async function authorizeBrokerToken(options: ThreadBrokerOptions, token: string 
 		const auth = authorizeSecret(token, { action, threadId, cwd: threadCwds.get(threadId) }, options.homeDir);
 		if (!auth.allowed) return auth;
 	}
-	return { allowed: true, threadIds: capability?.threadIds };
+	return { allowed: true, threadIds: action === "supervision" ? await resolveSupervisionThreadIds(storePath, managerDir ?? options.managerDir, capability) : capability?.threadIds };
+}
+
+async function resolveSupervisionThreadIds(storePath: string | undefined, managerDir: string | undefined, capability: ReturnType<typeof getCapabilityToken>): Promise<string[] | undefined> {
+	if (!capability?.cwdRoots) return capability?.threadIds;
+	try {
+		const document = await readThreadStore(storePath, managerDir);
+		const explicitThreadIds = capability.threadIds ? new Set(capability.threadIds) : undefined;
+		return Object.values(document.threads)
+			.filter((thread) => {
+				if (explicitThreadIds && !explicitThreadIds.has(thread.id)) return false;
+				const cwd = thread.worktree?.sourceCwd ?? thread.cwd;
+				return capability.cwdRoots!.some((root) => isPathInside(cwd, root));
+			})
+			.map((thread) => thread.id);
+	} catch {
+		return [];
+	}
 }
 
 async function resolveThreadCwds(storePath: string | undefined, managerDir: string | undefined, threadIds: string[]): Promise<Map<string, string>> {
