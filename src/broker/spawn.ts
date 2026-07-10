@@ -162,7 +162,7 @@ function quoteWindowsArg(value: string): string {
 }
 
 export function buildBrokerEnv(source: NodeJS.ProcessEnv = process.env, homeDir?: string): NodeJS.ProcessEnv {
-	const allowed = new Set(["path", "systemroot", "windir", "home", "userprofile", "appdata", "localappdata", "tmp", "temp", "lang", "lc_all", "ci", "gh_token", "github_token"]);
+	const allowed = new Set(["path", "systemroot", "windir", "home", "userprofile", "appdata", "localappdata", "tmp", "temp", "lang", "lc_all", "ci", "gh_token", "github_token", "pi_coding_agent_dir"]);
 	const env: NodeJS.ProcessEnv = { NODE_NO_WARNINGS: "1" };
 	if (homeDir) env.PI_THREAD_MANAGER_HOME = homeDir;
 	for (const [key, value] of Object.entries(source)) {

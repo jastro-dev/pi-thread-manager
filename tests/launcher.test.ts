@@ -36,6 +36,11 @@ test("safe child env preserves Windows Path casing", () => {
 	assert.equal(env.Path, "C:/Windows/System32");
 });
 
+test("safe child env preserves Pi agent directory for child auth and config", () => {
+	const env = buildSafeChildEnv("thread-1", { PI_CODING_AGENT_DIR: "/tmp/pi-agent" });
+	assert.equal(env.PI_CODING_AGENT_DIR, "/tmp/pi-agent");
+});
+
 test("launcher refuses non-absolute Pi command fallback", () => {
 	assert.throws(() => launchPiRpcThread(createThread(), { getCommand: () => ({ command: "pi", args: [] }), spawn: (() => { throw new Error("should not spawn"); }) as never }), /non-absolute command/);
 });

@@ -41,8 +41,8 @@ test("computes platform-specific socket and launch specs", async () => {
 	assert.equal(windows.kind, "windows-launcher");
 });
 
-test("broker env preserves GitHub CLI auth and drops unrelated secrets", () => {
-	const env = buildBrokerEnv({ PATH: "/bin", Path: "C:/bin", GH_TOKEN: "gh", GITHUB_TOKEN: "github", API_TOKEN: "api", OPENAI_API_KEY: "openai", AWS_SECRET_ACCESS_KEY: "aws" }, "/tmp/thread-home");
+test("broker env preserves Pi agent directory and GitHub CLI auth while dropping unrelated secrets", () => {
+	const env = buildBrokerEnv({ PATH: "/bin", Path: "C:/bin", PI_CODING_AGENT_DIR: "/tmp/pi-agent", GH_TOKEN: "gh", GITHUB_TOKEN: "github", API_TOKEN: "api", OPENAI_API_KEY: "openai", AWS_SECRET_ACCESS_KEY: "aws" }, "/tmp/thread-home");
 	assert.equal(env.PATH, "/bin");
 	assert.equal(env.Path, "C:/bin");
 	assert.equal(env.GH_TOKEN, "gh");
@@ -50,6 +50,7 @@ test("broker env preserves GitHub CLI auth and drops unrelated secrets", () => {
 	assert.equal(env.OPENAI_API_KEY, "openai");
 	assert.equal(env.AWS_SECRET_ACCESS_KEY, "aws");
 	assert.equal(env.PI_THREAD_MANAGER_HOME, "/tmp/thread-home");
+	assert.equal(env.PI_CODING_AGENT_DIR, "/tmp/pi-agent");
 	assert.equal(env.API_TOKEN, undefined);
 });
 

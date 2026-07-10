@@ -61,7 +61,7 @@ export function launchPiRpcThread(thread: ManagedThread, deps: LaunchDeps = {}):
 }
 
 export function buildSafeChildEnv(threadId: string, source: NodeJS.ProcessEnv = process.env, childEnv: Record<string, string> = {}): NodeJS.ProcessEnv {
-	const allowed = new Set(["PATH", "Path", "SystemRoot", "WINDIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMP", "TEMP", "LANG", "LC_ALL", "CI"]);
+	const allowed = new Set(["PATH", "Path", "SystemRoot", "WINDIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMP", "TEMP", "LANG", "LC_ALL", "CI", "PI_CODING_AGENT_DIR"]);
 	const env: NodeJS.ProcessEnv = { ...childEnv, PI_THREAD_ID: threadId };
 	for (const [key, value] of Object.entries(source)) {
 		if (value === undefined) continue;
