@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import threadManagerExtension, { parseThreadCommand, runThreadCommand, type BrokerPort } from "../src/extension.ts";
-import { formatToolResult } from "../src/presentation.ts";
+import { formatThreadSummary, formatToolResult } from "../src/presentation.ts";
 
 test("parses thread commands", () => {
 	assert.deepEqual(parseThreadCommand("", "/repo"), { action: "status", params: { cwd: "/repo", createdBy: "command" } });
@@ -11,7 +11,7 @@ test("parses thread commands", () => {
 	assert.deepEqual(parseThreadCommand("send thread-1 key=value --flag keep", "/repo"), { action: "send", params: { cwd: "/repo", createdBy: "command", threadId: "thread-1", message: "key=value --flag keep" } });
 	assert.deepEqual(parseThreadCommand("follow-up thread-1 later", "/repo"), { action: "follow_up", params: { cwd: "/repo", createdBy: "command", threadId: "thread-1", message: "later" } });
 	assert.deepEqual(parseThreadCommand("read thread-1 limit=10 cursor=2", "/repo"), { action: "read", params: { cwd: "/repo", createdBy: "command", threadId: "thread-1", limit: 10, cursor: 2 } });
-	assert.deepEqual(parseThreadCommand("create worktreeMode=shared_cwd_allowed baseRef=main worker build", "/repo"), { action: "create", params: { cwd: "/repo", createdBy: "command", worktreeMode: "shared_cwd_allowed", baseRef: "main", name: "worker", initialPrompt: "build" } });
+	assert.deepEqual(parseThreadCommand("create worktreeMode=shared_cwd_allowed baseRef=main model=openai-codex/gpt-5.6-luna thinking=xhigh role=executor worker build", "/repo"), { action: "create", params: { cwd: "/repo", createdBy: "command", worktreeMode: "shared_cwd_allowed", baseRef: "main", model: "openai-codex/gpt-5.6-luna", thinking: "xhigh", role: "executor", name: "worker", initialPrompt: "build" } });
 	assert.deepEqual(parseThreadCommand("cleanup thread-1", "/repo"), { action: "cleanup", params: { cwd: "/repo", createdBy: "command", threadId: "thread-1" } });
 });
 
@@ -23,7 +23,7 @@ test("registers command and model-facing tool once", () => {
 	assert.equal(harness.commands.has("threads"), true);
 	assert.equal(harness.tools.has("thread"), true);
 	const properties = harness.tools.get("thread")!.parameters.properties;
-	for (const key of ["repo", "prNumber", "pr", "fixerThreadId", "baseRef"] as const) assert.ok(properties[key], `${key} missing`);
+	for (const key of ["repo", "prNumber", "pr", "fixerThreadId", "baseRef", "thinking", "role"] as const) assert.ok(properties[key], `${key} missing`);
 	assert.deepEqual((properties.action as { enum: string[] }).enum.includes("cleanup"), true);
 	assert.deepEqual((properties.worktreeMode as { enum: string[] }).enum, ["isolated_required", "shared_cwd_allowed"]);
 });
@@ -50,6 +50,26 @@ test("tool create maps message to initialPrompt", async () => {
 	threadManagerExtension(harness.pi as never, { spawnBroker: async () => undefined, createClient: () => client });
 	await harness.tools.get("thread")!.execute("call-1", { action: "create", message: "build this" }, undefined, undefined, createContext());
 	assert.equal(client.requests[0].params.initialPrompt, "build this");
+});
+
+test("thread presentation includes exact model, thinking, and role", () => {
+	const text = formatThreadSummary({
+		id: "thread-1",
+		status: "idle",
+		cwd: "/repo",
+		model: "openai-codex/gpt-5.6-luna",
+		thinking: "xhigh",
+		role: "executor",
+		tags: [],
+		createdAt: "now",
+		updatedAt: "now",
+		createdBy: "test",
+		launchProfile: { cwd: "/repo", model: "openai-codex/gpt-5.6-luna", thinking: "xhigh", extensionLoading: "none", approvalMode: "ask", inheritedFromParent: false },
+		safetyPolicy: { worktreeMode: "shared_cwd_allowed", queuePolicy: "reject_when_running", githubWritePolicy: "ask", forceKillPolicy: "deny", restartPolicy: { mode: "manual", maxRestarts: 0, backoffSeconds: 30, allowWhenOperationUnknown: false } },
+	});
+	assert.match(text, /model=openai-codex\/gpt-5\.6-luna/);
+	assert.match(text, /thinking=xhigh/);
+	assert.match(text, /role=executor/);
 });
 
 test("empty approval lists render as approvals", () => {

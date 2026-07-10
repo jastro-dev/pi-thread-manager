@@ -37,7 +37,7 @@ The model-facing tool is `thread`. It exposes the same core actions as `/threads
 ```text
 /threads status
 /threads list
-/threads create [worktreeMode=isolated_required] [baseRef=<ref>] <name> [initial prompt]
+/threads create [worktreeMode=isolated_required] [baseRef=<ref>] [model=<provider/model>] [thinking=<level>] [role=executor] <name> [initial prompt]
 /threads create worktreeMode=shared_cwd_allowed <name> [initial prompt]
 /threads read <thread-id> [limit=<n>] [cursor=<n>]
 /threads send <thread-id> <message>
@@ -111,12 +111,13 @@ Example:
 }
 ```
 
-`childEnv` may inject non-secret `PI_*` string flags into every managed child Pi process. It cannot override the manager-owned `PI_THREAD_ID` and rejects secret-like names.
+`childEnv` may inject non-secret `PI_*` string flags into every managed child Pi process. It cannot override the manager-owned `PI_THREAD_ID` and rejects secret-like names. `defaultModel` and `defaultThinking` are optional, validated defaults for create requests that omit those fields; explicit request values win. The confirmed Sol/Luna setup uses `openai-codex/gpt-5.6-sol` for the parent Pi and `openai-codex/gpt-5.6-luna` with `xhigh` for managed executor children.
 
 ## Safety model
 
 - Child sessions are normal Pi RPC processes running as the current user.
-- Launch profiles record cwd, model, extension-loading policy, approval mode, and inherited parent values.
+- Launch profiles record cwd, exact model, thinking level, extension-loading policy, approval mode, and inherited parent values.
+- Executor threads inject a bounded no-delegation role contract and launch with `--no-extensions` so orchestration extensions and tools cannot recursively create fleets.
 - A delivered prompt is not completion. `send`, `follow_up`, and `steer` acknowledge delivery/acceptance only; use `read` or `status` to inspect progress.
 - The daemon persists operations and approvals before external writes.
 - GitHub write actions default to approval-required.

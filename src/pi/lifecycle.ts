@@ -2,6 +2,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { getThreadManagerDir, getThreadStorePath } from "../broker/paths.ts";
+import { loadThreadManagerConfig, type ThreadManagerConfig } from "../config.ts";
 import { authorizeSecret } from "../broker/auth.ts";
 import type { BrokerRequestContext, BrokerRequestHandler } from "../broker/broker.ts";
 import { DuplicateJobSnapshotError, ThreadScheduler } from "../automation/scheduler.ts";
@@ -13,12 +14,15 @@ import {
 	normalizeSafetyPolicy,
 	validateBaseRef,
 	validateLaunchProfile,
+	validateModelReference,
 	validateName,
 	validatePrompt,
 	validateReadLimit,
 	validateSafetyPolicy,
 	validateTags,
+	validateThinkingLevel,
 	validateThreadId,
+	validateThreadRole,
 } from "../protocol.ts";
 import { acquireFileLock } from "../store/lock.ts";
 import { mutateThreadStore, readThreadStore, readThreadStoreSafe } from "../store/thread-store.ts";
@@ -26,6 +30,7 @@ import { DEFAULT_PROTOCOL_LIMITS, type CreateThreadInput, type DaemonStatus, typ
 import { ThreadWorktreeManager, type WorktreeCleanupResult, type WorktreeInspection } from "../worktree/thread-worktrees.ts";
 import { ensureThreadPathsForManager } from "./session-files.ts";
 import { launchPiRpcThread, type LaunchedThreadProcess } from "./launcher.ts";
+import { injectExecutorRole } from "./executor-role.ts";
 import { discoverSessionFile, readSessionTranscript, realpathCwd, type TranscriptWindow } from "./session-transcript.ts";
 import {
 	applyCreateFailed,
@@ -51,7 +56,7 @@ import {
 	summarizeStore,
 	waitForChildExit,
 } from "./thread-transitions.ts";
-import type { PiRpcCommand, PiRpcUiRequest } from "./rpc-client.ts";
+import type { PiRpcCommand, PiRpcState, PiRpcUiRequest } from "./rpc-client.ts";
 
 export { isPassiveChildUiRequest, summarizeStore } from "./thread-transitions.ts";
 
@@ -67,6 +72,7 @@ export interface ThreadServiceDeps {
 	worktreeManager?: WorktreeManagerPort;
 	githubReviewPort?: GithubReviewPort;
 	daemonEpoch?: string;
+	config?: ThreadManagerConfig;
 }
 
 export interface WorktreeManagerPort {
@@ -87,6 +93,7 @@ export class ThreadService implements BrokerRequestHandler {
 	private readonly worktreeManager: WorktreeManagerPort;
 	private readonly githubReviewPort: GithubReviewPort;
 	private readonly daemonEpoch: string;
+	private readonly config: ThreadManagerConfig;
 	private readonly handles = new Map<string, LaunchedThreadProcess>();
 	private readonly commandLocks = new Map<string, Promise<void>>();
 	private readonly scheduler: ThreadScheduler;
@@ -96,9 +103,10 @@ export class ThreadService implements BrokerRequestHandler {
 		this.statePath = deps.statePath ?? getThreadStorePath(deps.homeDir);
 		this.managerDir = deps.managerDir ?? path.dirname(this.statePath);
 		this.homeDir = deps.homeDir;
+		this.config = deps.config ?? loadThreadManagerConfig();
 		this.now = deps.now ?? (() => new Date());
 		this.randomId = deps.randomId ?? (() => randomUUID());
-		this.launchThread = deps.launchThread ?? ((thread) => launchPiRpcThread(thread, { onUiRequest: (request) => this.recordChildUiRequest(thread.id, request) }));
+		this.launchThread = deps.launchThread ?? ((thread) => launchPiRpcThread(thread, { config: this.config, onUiRequest: (request) => this.recordChildUiRequest(thread.id, request) }));
 		this.worktreeManager = deps.worktreeManager ?? new ThreadWorktreeManager({ now: this.now });
 		this.githubReviewPort = deps.githubReviewPort ?? { fetchSnapshot: ({ repo, prNumber }) => fetchGithubReviewThreads(repo, prNumber) };
 		this.daemonEpoch = deps.daemonEpoch ?? randomUUID();
@@ -184,6 +192,11 @@ export class ThreadService implements BrokerRequestHandler {
 		const now = this.now().toISOString();
 		const paths = await ensureThreadPathsForManager(id, this.managerDir);
 		const name = validateName(input.name);
+		const role = validateThreadRole(input.role);
+		const requestedModel = input.launchProfile?.model ?? input.model ?? this.config.defaultModel;
+		const requestedThinking = input.launchProfile?.thinking ?? input.thinking ?? this.config.defaultThinking;
+		if (requestedModel !== undefined) validateModelReference(requestedModel);
+		if (requestedThinking !== undefined) validateThinkingLevel(requestedThinking);
 		const requestedSafetyPolicy = { ...input.safetyPolicy };
 		const requestedWorktreeMode = input.safetyPolicy?.worktreeMode ?? input.worktreeMode;
 		if (requestedWorktreeMode) requestedSafetyPolicy.worktreeMode = requestedWorktreeMode;
@@ -207,8 +220,9 @@ export class ThreadService implements BrokerRequestHandler {
 		let tags;
 		try {
 			if (input.launchProfile?.cwd !== undefined && input.launchProfile.cwd !== cwd) throw new Error("launch profile cwd must match thread cwd");
-			launchProfile = validateLaunchProfile(normalizeLaunchProfile({ model: input.model, name, ...input.launchProfile, cwd }));
-			if (launchProfile.extensionLoading !== "inherit") throw new Error("only inherited extension loading is supported in this release");
+			const extensionLoading = input.launchProfile?.extensionLoading ?? (role === "executor" ? "none" : "inherit");
+			if (role === "executor" && extensionLoading !== "none") throw new Error("executor threads require extensionLoading=none");
+			launchProfile = validateLaunchProfile(normalizeLaunchProfile({ ...input.launchProfile, model: requestedModel, thinking: requestedThinking, name, extensionLoading, cwd }));
 			if (launchProfile.approvalMode === "read_only") throw new Error("read-only child launch profile is not implemented yet");
 			tags = validateTags(input.tags);
 		} catch (error) {
@@ -221,7 +235,9 @@ export class ThreadService implements BrokerRequestHandler {
 			parentThreadId: input.parentThreadId,
 			status: "creating",
 			cwd,
-			model: input.model,
+			model: requestedModel,
+			thinking: requestedThinking,
+			role,
 			tags,
 			createdAt: now,
 			updatedAt: now,
@@ -277,7 +293,8 @@ export class ThreadService implements BrokerRequestHandler {
 			await this.updateThreadStatus(id, "starting", operationId);
 			const handle = await this.launchThread(thread);
 			launchedHandle = handle;
-			await handle.rpc.request({ type: "get_state" }, STARTUP_STATE_TIMEOUT_MS);
+			const state = await handle.rpc.request<PiRpcState>({ type: "get_state" }, STARTUP_STATE_TIMEOUT_MS);
+			attestChildState(thread, state);
 			const sessionFile = await discoverSessionFile(paths.sessionDir, thread.sessionFile);
 			this.handles.set(id, handle);
 			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
@@ -296,8 +313,7 @@ export class ThreadService implements BrokerRequestHandler {
 			return document.threads[id];
 		} catch (error) {
 			if (launchedHandle) {
-				launchedHandle.rpc.destroy(error instanceof Error ? error : new Error(String(error)));
-				launchedHandle.child?.kill("SIGTERM");
+				await stopLaunchedThread(launchedHandle, error);
 				this.handles.delete(id);
 			}
 			const current = thread.worktree?.mode === "isolated" ? await this.safeRollbackAllocation(thread.worktree) : undefined;
@@ -353,22 +369,7 @@ export class ThreadService implements BrokerRequestHandler {
 
 	async sendToThread(threadId: string, action: "send" | "follow_up" | "steer", message: string, requestId?: string): Promise<ThreadOperation> {
 		const operationId = `op-${this.randomId()}`;
-		let rpcCommand: PiRpcCommand;
-		switch (action) {
-			case "send":
-				rpcCommand = { type: "prompt", message };
-				break;
-			case "follow_up":
-				rpcCommand = { type: "follow_up", message };
-				break;
-			case "steer":
-				rpcCommand = { type: "steer", message };
-				break;
-			default: {
-				const exhaustive: never = action;
-				throw new Error(`Unsupported send action ${exhaustive}`);
-			}
-		}
+		let deliveredMessage = message;
 		const now = this.now().toISOString();
 		try {
 			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
@@ -383,7 +384,9 @@ export class ThreadService implements BrokerRequestHandler {
 					const queued = Object.values(document.operations).filter((operation) => operation.threadId === threadId && operation.kind === "follow_up" && !isTerminalOperation(operation.status)).length;
 					if (queued >= DEFAULT_PROTOCOL_LIMITS.maxQueueDepth) throw new Error(`follow_up queue limit reached (${DEFAULT_PROTOCOL_LIMITS.maxQueueDepth})`);
 				}
-				document.operations[operationId] = createOperation(operationId, action, threadId, now, message, requestId);
+				deliveredMessage = injectExecutorRole(message, thread.role);
+				validatePrompt(deliveredMessage);
+				document.operations[operationId] = createOperation(operationId, action, threadId, now, deliveredMessage, requestId);
 				thread.status = "running";
 				if (action === "send" || !thread.currentOperationId) thread.currentOperationId = operationId;
 				thread.lastActivityAt = now;
@@ -393,6 +396,7 @@ export class ThreadService implements BrokerRequestHandler {
 			if (error instanceof DuplicateOperationError) return await this.requireDeliveredDuplicate(error.operationId);
 			throw error;
 		}
+		const rpcCommand = { type: action === "send" ? "prompt" : action, message: deliveredMessage } as PiRpcCommand;
 		const duplicate = await this.getDuplicateOperation(threadId, requestId, operationId);
 		if (duplicate) return requireDeliveredOperation(duplicate);
 		return await this.withThreadCommandLock(threadId, async () => {
@@ -1095,7 +1099,8 @@ export class ThreadService implements BrokerRequestHandler {
 		let handle: LaunchedThreadProcess | undefined;
 		try {
 			handle = await this.launchThread(thread);
-			const state = await handle.rpc.request<{ isStreaming?: boolean; pendingMessageCount?: number }>({ type: "get_state" }, STARTUP_STATE_TIMEOUT_MS);
+			const state = await handle.rpc.request<PiRpcState>({ type: "get_state" }, STARTUP_STATE_TIMEOUT_MS);
+			attestChildState(thread, state);
 			this.handles.set(thread.id, handle);
 			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
 				const current = document.threads[thread.id];
@@ -1110,8 +1115,7 @@ export class ThreadService implements BrokerRequestHandler {
 			});
 		} catch (error) {
 			if (handle) {
-				handle.rpc.destroy(error instanceof Error ? error : new Error(String(error)));
-				handle.child?.kill("SIGTERM");
+				await stopLaunchedThread(handle, error);
 				this.handles.delete(thread.id);
 			}
 			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
@@ -1123,6 +1127,29 @@ export class ThreadService implements BrokerRequestHandler {
 			});
 		}
 	}
+}
+
+export function attestChildState(thread: ManagedThread, state: PiRpcState): void {
+	const expectedModel = thread.launchProfile.model ?? thread.model;
+	if (expectedModel !== undefined) {
+		const actualModel = state.model && typeof state.model.provider === "string" && typeof state.model.id === "string"
+			? `${state.model.provider}/${state.model.id}`
+			: undefined;
+		if (actualModel !== expectedModel) {
+			throw new Error(`Child model attestation mismatch: expected exact ${expectedModel}, got ${actualModel ?? "no model"}`);
+		}
+	}
+	const expectedThinking = thread.launchProfile.thinking ?? thread.thinking;
+	if (expectedThinking !== undefined && state.thinkingLevel !== expectedThinking) {
+		throw new Error(`Child thinking attestation mismatch: expected exact ${expectedThinking}, got ${state.thinkingLevel ?? "none"}`);
+	}
+}
+
+async function stopLaunchedThread(handle: LaunchedThreadProcess, reason: unknown): Promise<void> {
+	handle.rpc.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+	if (!handle.child) return;
+	handle.child.kill("SIGTERM");
+	await waitForChildExit(handle.child, 2000);
 }
 
 export function createThreadService(deps: ThreadServiceDeps = {}): ThreadService {

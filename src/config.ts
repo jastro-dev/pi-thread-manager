@@ -2,6 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { validateModelReference, validateThinkingLevel } from "./protocol.ts";
+import type { ThinkingLevel } from "./types.ts";
+
 export interface ThreadManagerConfig {
 	/** Command used to spawn managed child Pi sessions when set (e.g. "pnpx" or "/usr/bin/node"). */
 	launchCommand?: string;
@@ -11,6 +14,12 @@ export interface ThreadManagerConfig {
 
 	/** Non-secret PI_* environment flags injected into managed child Pi sessions. */
 	childEnv: Record<string, string>;
+
+	/** Exact provider/model reference used when a create request omits its model. */
+	defaultModel?: string;
+
+	/** Pi thinking level used when a create request omits its thinking level. */
+	defaultThinking?: ThinkingLevel;
 }
 
 export interface ThreadManagerConfigDeps {
@@ -64,8 +73,19 @@ export function loadThreadManagerConfig(deps: ThreadManagerConfigDeps = {}): Thr
 			config.childEnv = parseChildEnv(parsedConfig.childEnv as Record<string, unknown>);
 		}
 
+		if (Object.hasOwn(parsedConfig, "defaultModel")) {
+			config.defaultModel = validateModelReference(parsedConfig.defaultModel);
+		}
+
+		if (Object.hasOwn(parsedConfig, "defaultThinking")) {
+			config.defaultThinking = validateThinkingLevel(parsedConfig.defaultThinking);
+		}
+
 		return config;
 	} catch (error) {
+		if (error instanceof Error && (error.message.includes("exact provider/model") || error.message.includes("thinking level"))) {
+			throw new Error(`Invalid fixed child model/thinking configuration at ${configPath}: ${error.message}`, { cause: error });
+		}
 		const message = `Failed to load thread-manager config at ${configPath}:`;
 		if (deps.onError) deps.onError(message, error);
 		else console.error(message, error);

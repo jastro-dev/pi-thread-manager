@@ -20,6 +20,7 @@ export interface LaunchDeps {
 	getCommand?: (args: string[]) => PiSpawnCommand;
 	now?: () => Date;
 	onUiRequest?: (request: PiRpcUiRequest) => unknown | Promise<unknown>;
+	config?: ReturnType<typeof loadThreadManagerConfig>;
 }
 
 export function buildPiRpcArgs(thread: ManagedThread): string[] {
@@ -27,8 +28,11 @@ export function buildPiRpcArgs(thread: ManagedThread): string[] {
 	if ((thread.restartCount ?? 0) > 0 && thread.safetyPolicy.restartPolicy.mode === "from_session" && thread.sessionFile) {
 		args.push("--session", thread.sessionFile);
 	}
+	if (thread.launchProfile.extensionLoading === "none") args.push("--no-extensions");
 	const model = thread.launchProfile.model ?? thread.model;
 	if (model) args.push("--model", model);
+	const thinking = thread.launchProfile.thinking ?? thread.thinking;
+	if (thinking) args.push("--thinking", thinking);
 	if (thread.name) args.push("--name", thread.name);
 	return args;
 }
@@ -42,7 +46,7 @@ export function launchPiRpcThread(thread: ManagedThread, deps: LaunchDeps = {}):
 	}
 	const child = spawnFn(command.command, command.args, {
 		cwd: thread.cwd,
-		env: buildSafeChildEnv(thread.id, process.env, loadThreadManagerConfig().childEnv),
+		env: buildSafeChildEnv(thread.id, process.env, (deps.config ?? loadThreadManagerConfig()).childEnv),
 		stdio: "pipe",
 		windowsHide: true,
 	}) as ChildProcessWithoutNullStreams;

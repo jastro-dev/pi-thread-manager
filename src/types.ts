@@ -70,13 +70,16 @@ export interface RestartPolicy {
 	allowWhenOperationUnknown: boolean;
 }
 
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ExtensionLoadingPolicy = "inherit" | "default" | "none";
 export type ApprovalMode = "inherit" | "ask" | "read_only";
 export type WorktreeMode = "isolated_required" | "shared_cwd_allowed" | "read_only";
+export type ThreadRole = "executor";
 
 export interface LaunchProfile {
 	cwd: string;
 	model?: string;
+	thinking?: ThinkingLevel;
 	name?: string;
 	extensionLoading: ExtensionLoadingPolicy;
 	approvalMode: ApprovalMode;
@@ -137,6 +140,8 @@ export interface ManagedThread {
 	status: ThreadStatus;
 	cwd: string;
 	model?: string;
+	thinking?: ThinkingLevel;
+	role?: ThreadRole;
 	tags: string[];
 	createdAt: string;
 	updatedAt: string;
@@ -339,6 +344,8 @@ export interface CreateThreadInput {
 	name?: string;
 	cwd: string;
 	model?: string;
+	thinking?: ThinkingLevel;
+	role?: ThreadRole;
 	initialPrompt?: string;
 	tags?: string[];
 	createdBy: string;

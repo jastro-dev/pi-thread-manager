@@ -7,7 +7,7 @@ import test from "node:test";
 import { loadOrCreateAuthRoot } from "../src/broker/auth.ts";
 import { getThreadManagerDir, getThreadStorePath } from "../src/broker/paths.ts";
 import { mutateThreadStore, readThreadStore } from "../src/store/thread-store.ts";
-import { isPassiveChildUiRequest, ThreadService, type WorktreeManagerPort } from "../src/pi/lifecycle.ts";
+import { attestChildState, isPassiveChildUiRequest, ThreadService, type WorktreeManagerPort } from "../src/pi/lifecycle.ts";
 import type { ChildRpcPort } from "../src/pi/rpc-client.ts";
 import type { ReviewSnapshot } from "../src/automation/review-loop.ts";
 import type { ManagedThread, SafetyPolicy, ThreadWorktree } from "../src/types.ts";
@@ -19,6 +19,45 @@ test("reserves thread before spawn and marks failed spawn without losing record"
 	const thread = Object.values(store.threads)[0];
 	assert.equal(thread.status, "failed");
 	assert.match(thread.lastError ?? "", /spawn failed/);
+});
+
+test("attests exact child model and thinking without provider fallback", () => {
+	const thread = {
+		model: "openai-codex/gpt-5.6-luna",
+		thinking: "xhigh",
+		launchProfile: { cwd: "/repo", extensionLoading: "inherit", approvalMode: "ask", inheritedFromParent: true },
+	} as ManagedThread;
+	assert.doesNotThrow(() => attestChildState(thread, { model: { provider: "openai-codex", id: "gpt-5.6-luna" }, thinkingLevel: "xhigh" }));
+	assert.throws(() => attestChildState(thread, { model: { provider: "openai", id: "gpt-5.6-luna" }, thinkingLevel: "xhigh" }), /model attestation mismatch/);
+	assert.throws(() => attestChildState(thread, { model: { provider: "openai-codex", id: "gpt-5.6-luna" }, thinkingLevel: "high" }), /thinking attestation mismatch/);
+});
+
+test("applies configured model and thinking defaults while explicit values win", async () => {
+	const { service, managerDir, rpc } = await createService({ config: { launchArgs: [], childEnv: {}, defaultModel: "openai-codex/gpt-5.6-luna", defaultThinking: "xhigh" } });
+	rpc.state = { isStreaming: false, pendingMessageCount: 0, model: { provider: "openai-codex", id: "gpt-5.6-luna" }, thinkingLevel: "xhigh" };
+	const defaulted = await service.createThread({ cwd: managerDir, createdBy: "test", safetyPolicy: sharedSafetyPolicy() });
+	assert.equal(defaulted.model, "openai-codex/gpt-5.6-luna");
+	assert.equal(defaulted.thinking, "xhigh");
+});
+
+test("persists child attestation mismatch as failed creation", async () => {
+	const { service, managerDir, statePath, rpc } = await createService();
+	rpc.state = { isStreaming: false, pendingMessageCount: 0, model: { provider: "openai", id: "wrong" }, thinkingLevel: "off" };
+	await assert.rejects(() => service.createThread({ cwd: managerDir, model: "openai-codex/gpt-5.6-luna", thinking: "xhigh", createdBy: "test", safetyPolicy: sharedSafetyPolicy() }), /model attestation mismatch/);
+	const store = await readThreadStore(statePath, managerDir);
+	const thread = Object.values(store.threads)[0];
+	assert.equal(thread.status, "failed");
+	assert.match(thread.lastError ?? "", /expected exact openai-codex\/gpt-5\.6-luna/);
+	assert.equal(Object.values(store.operations)[0].status, "failed");
+});
+
+test("injects executor role and disables orchestration extensions", async () => {
+	const { service, managerDir, rpc } = await createService();
+	rpc.state = { isStreaming: false, pendingMessageCount: 0, model: { provider: "openai", id: "test" }, thinkingLevel: "off" };
+	const thread = await service.createThread({ cwd: managerDir, model: "openai/test", createdBy: "test", role: "executor", safetyPolicy: sharedSafetyPolicy(), initialPrompt: "Implement the bounded change" });
+	assert.equal(thread.role, "executor");
+	assert.equal(thread.launchProfile.extensionLoading, "none");
+	assert.match(String((rpc.calls[0] as { message: string }).message), /Managed executor contract/);
 });
 
 test("creates idle thread with explicit launch profile and pid", async () => {
@@ -1047,7 +1086,7 @@ test("review-loop validates all fixer prompts before dispatch", async () => {
 	assert.equal(Object.values(store.jobRuns)[0].status, "failed");
 });
 
-async function createService(options: { launchThread?: (thread: ManagedThread) => unknown; githubSnapshot?: ReviewSnapshot; now?: () => Date; worktreeManager?: WorktreeManagerPort } = {}) {
+async function createService(options: { launchThread?: (thread: ManagedThread) => unknown; githubSnapshot?: ReviewSnapshot; now?: () => Date; worktreeManager?: WorktreeManagerPort; config?: { launchArgs: string[]; childEnv: Record<string, string>; defaultModel?: string; defaultThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" } } = {}) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-lifecycle-"));
 	const managerDir = getThreadManagerDir(root);
 	await fs.mkdir(managerDir, { recursive: true });
@@ -1062,6 +1101,7 @@ async function createService(options: { launchThread?: (thread: ManagedThread) =
 		randomId: () => `${next++}`,
 		githubReviewPort: options.githubSnapshot ? { fetchSnapshot: async () => options.githubSnapshot! } : undefined,
 		worktreeManager: options.worktreeManager,
+		config: options.config,
 		launchThread: options.launchThread as never ?? (() => ({ pid: 1234, startedAt: "2026-01-01T00:00:00.000Z", rpc })),
 	});
 	return { service, statePath, managerDir, root, rpc };
@@ -1070,7 +1110,7 @@ async function createService(options: { launchThread?: (thread: ManagedThread) =
 class FakeRpc implements ChildRpcPort {
 	calls: unknown[] = [];
 	messages: unknown[] = [];
-	state = { isStreaming: true, pendingMessageCount: 0 };
+	state: { isStreaming?: boolean; pendingMessageCount?: number; model?: { provider: string; id: string }; thinkingLevel?: string } = { isStreaming: true, pendingMessageCount: 0, model: { provider: "openai", id: "test" }, thinkingLevel: "off" };
 	failNext?: Error;
 	failState?: Error;
 	failMessages?: Error;

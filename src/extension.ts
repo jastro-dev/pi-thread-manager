@@ -53,6 +53,7 @@ export default function threadManagerExtension(pi: ExtensionAPI, deps: ThreadMan
 			"Do not treat delivery acknowledgement as completion; read the thread to inspect progress.",
 			"Approval-required results mean the daemon stopped before a write and needs explicit approval.",
 			"Isolated create requires a clean Git source cwd; shared-cwd creation is legacy and requires explicit opt-in.",
+			"Executor threads are bounded, do not delegate, do not make unapproved public writes, and report concrete artifacts.",
 		],
 		parameters: {
 			type: "object",
@@ -64,7 +65,9 @@ export default function threadManagerExtension(pi: ExtensionAPI, deps: ThreadMan
 				cwd: { type: "string", description: "Source cwd used to allocate an isolated worktree; defaults to the parent session cwd" },
 				worktreeMode: { enum: ["isolated_required", "shared_cwd_allowed"], description: "Worktree safety mode for create. Defaults to isolated_required; shared_cwd_allowed is legacy explicit opt-in." },
 				baseRef: { type: "string", description: "Optional Git ref/SHA used as the base for an isolated worktree" },
-				model: { type: "string", description: "Optional model pattern" },
+				model: { type: "string", description: "Exact provider/model reference" },
+				thinking: { enum: ["off", "minimal", "low", "medium", "high", "xhigh"], description: "Pi thinking level" },
+				role: { enum: ["executor"], description: "Managed executor role; disables orchestration extensions" },
 				limit: { type: "number", description: "Read limit" },
 				cursor: { type: "number", description: "Read cursor" },
 				approvalId: { type: "string", description: "Approval id for approve/deny" },

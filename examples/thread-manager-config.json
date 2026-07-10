@@ -1,4 +1,6 @@
 {
+  "defaultModel": "openai-codex/gpt-5.6-luna",
+  "defaultThinking": "xhigh",
   "launchCommand": "aubx",
   "launchArgs": [
     "tsx"

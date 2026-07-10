@@ -78,8 +78,9 @@ test("launcher forwards child UI requests through handler", async () => {
 	assert.deepEqual(JSON.parse(child.writes[0]), { type: "extension_ui_response", id: "ui-1", value: "ui-1" });
 });
 
-test("RPC args use launch profile model", () => {
-	assert.deepEqual(buildPiRpcArgs(createThread({ launchProfile: { cwd: process.cwd(), extensionLoading: "inherit", approvalMode: "ask", inheritedFromParent: true, model: "openai/profile" } })).slice(-2), ["--model", "openai/profile"]);
+test("RPC args use launch profile model, thinking, and extension policy", () => {
+	const args = buildPiRpcArgs(createThread({ launchProfile: { cwd: process.cwd(), extensionLoading: "none", approvalMode: "ask", inheritedFromParent: true, model: "openai/profile", thinking: "xhigh" } }));
+	assert.deepEqual(args.slice(-5), ["--no-extensions", "--model", "openai/profile", "--thinking", "xhigh"]);
 });
 
 test("RPC args resume stored session after restart", () => {
@@ -124,6 +125,24 @@ test("local pi spawn resolver ignores the tsx daemon launcher", () => {
 test("thread-manager config defaults when config file is absent", () => {
 	const config = loadThreadManagerConfig({ configPath: "/missing/config.json", existsSync: () => false });
 	assert.deepEqual(config, { launchArgs: [], childEnv: {} });
+});
+
+test("thread-manager config parses validated model and thinking defaults", () => {
+	const config = loadThreadManagerConfig({
+		configPath: "/config.json",
+		existsSync: () => true,
+		readFileSync: () => JSON.stringify({ defaultModel: "openai-codex/gpt-5.6-luna", defaultThinking: "xhigh" }),
+	});
+	assert.equal(config.defaultModel, "openai-codex/gpt-5.6-luna");
+	assert.equal(config.defaultThinking, "xhigh");
+});
+
+test("thread-manager config rejects fuzzy model defaults without fallback", () => {
+	assert.throws(() => loadThreadManagerConfig({
+		configPath: "/config.json",
+		existsSync: () => true,
+		readFileSync: () => JSON.stringify({ defaultModel: "openai-codex/gpt-*" }),
+	}), /Invalid fixed child model\/thinking configuration/);
 });
 
 test("thread-manager config parses launch command and args", () => {

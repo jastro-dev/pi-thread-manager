@@ -21,8 +21,13 @@ export function formatThreadSummary(thread: ManagedThread): string {
 	const name = thread.name ? ` ${thread.name}` : "";
 	const pid = thread.pid ? ` pid=${thread.pid}` : "";
 	const op = thread.currentOperationId ? ` op=${thread.currentOperationId}` : "";
+	const model = thread.launchProfile.model ?? thread.model;
+	const modelText = model ? ` model=${model}` : "";
+	const thinking = thread.launchProfile.thinking ?? thread.thinking;
+	const thinkingText = thinking ? ` thinking=${thinking}` : "";
+	const role = thread.role ? ` role=${thread.role}` : "";
 	const worktree = formatWorktreeSummary(thread);
-	return redactSensitiveText(`${thread.id}${name}: ${thread.status}${pid}${op} cwd=${thread.cwd}${worktree}`);
+	return redactSensitiveText(`${thread.id}${name}: ${thread.status}${pid}${op}${role}${modelText}${thinkingText} cwd=${thread.cwd}${worktree}`);
 }
 
 export function formatReadResult(result: ThreadReadResult): string {
@@ -32,7 +37,7 @@ export function formatReadResult(result: ThreadReadResult): string {
 }
 
 export function formatOperation(operation: ThreadOperation): string {
-	return redactSensitiveText(`${operation.kind} ${operation.id}: ${operation.status}${operation.message ? ` — ${operation.message}` : operation.error ? ` — ${operation.error}` : ""}`);
+	return redactSensitiveText(`${operation.kind} ${operation.id}: ${operation.status}${operation.message ? ` - ${operation.message}` : operation.error ? ` - ${operation.error}` : ""}`);
 }
 
 function formatWorktreeSummary(thread: ManagedThread): string {

@@ -12,7 +12,9 @@ import {
 	validateBrokerRequest,
 	validateCapability,
 	validateLaunchProfile,
+	validateModelReference,
 	validatePrompt,
+	validateThinkingLevel,
 	validateRestartPolicy,
 	validateScheduleInterval,
 } from "../src/protocol.ts";
@@ -108,6 +110,10 @@ test("validates restart and launch profile policy", () => {
 	assert.deepEqual(validateLaunchProfile(profile), profile);
 	assert.throws(() => validateLaunchProfile({ ...profile, cwd: "relative" }), /absolute/);
 	assert.throws(() => normalizeProtocolSafetyPolicy({ queuePolicy: "bad" as never }), /unknown queue policy/);
+	assert.equal(validateModelReference("openai-codex/gpt-5.6-luna"), "openai-codex/gpt-5.6-luna");
+	assert.equal(validateThinkingLevel("xhigh"), "xhigh");
+	assert.throws(() => validateModelReference("openai-codex/gpt-*"), /exact provider\/model/);
+	assert.throws(() => validateThinkingLevel("max"), /thinking level/);
 });
 
 test("invalidates approvals when TOCTOU scope changes", () => {

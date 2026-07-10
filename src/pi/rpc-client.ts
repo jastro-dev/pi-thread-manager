@@ -1,6 +1,8 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
+import type { ThinkingLevel } from "../types.ts";
+
 export type PiRpcCommand = Record<string, unknown> & { type: string; id?: string };
 export type PiRpcResponse<T = unknown> = {
 	type: "response";
@@ -11,6 +13,13 @@ export type PiRpcResponse<T = unknown> = {
 	error?: string;
 };
 export type PiRpcUiRequest = Record<string, unknown> & { type: "extension_ui_request"; id: string };
+
+export interface PiRpcState {
+	model?: { provider?: string; id?: string } | null;
+	thinkingLevel?: ThinkingLevel;
+	isStreaming?: boolean;
+	pendingMessageCount?: number;
+}
 
 export interface PiRpcClientOptions {
 	onUiRequest?: (request: PiRpcUiRequest) => unknown | Promise<unknown>;

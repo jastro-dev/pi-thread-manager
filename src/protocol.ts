@@ -18,13 +18,17 @@ import {
 	type RestartPolicy,
 	type SafetyPolicy,
 	type ThreadAction,
+	type ThreadRole,
 	type ThreadStatus,
+	type ThinkingLevel,
 } from "./types.ts";
 
 const THREAD_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/;
 const REQUEST_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,119}$/;
 const TAG_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,63}$/;
 const BASE_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,199}$/;
+const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,199}$/;
+const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 const THREAD_ACTIONS = new Set<ThreadAction>([
 	"handshake",
 	"status",
@@ -68,6 +72,7 @@ export function normalizeLaunchProfile(input: Partial<LaunchProfile> & { cwd: st
 	return {
 		cwd: input.cwd,
 		model: input.model,
+		thinking: input.thinking,
 		name: input.name,
 		extensionLoading: input.extensionLoading ?? "inherit",
 		approvalMode: input.approvalMode ?? "ask",
@@ -121,6 +126,26 @@ export function validateBaseRef(baseRef: unknown): string | undefined {
 		throw createProtocolError("baseRef must be a short git ref or SHA token");
 	}
 	return baseRef;
+}
+
+export function validateModelReference(model: unknown): string {
+	if (typeof model !== "string" || !MODEL_PATTERN.test(model) || model.includes("*") || model.includes("?")) {
+		throw createProtocolError("model must be an exact provider/model reference");
+	}
+	return model;
+}
+
+export function validateThinkingLevel(level: unknown): ThinkingLevel {
+	if (typeof level !== "string" || !THINKING_LEVELS.has(level as ThinkingLevel)) {
+		throw createProtocolError("thinking level must be one of off, minimal, low, medium, high, xhigh");
+	}
+	return level as ThinkingLevel;
+}
+
+export function validateThreadRole(role: unknown): ThreadRole | undefined {
+	if (role === undefined) return undefined;
+	if (role !== "executor") throw createProtocolError("thread role must be executor");
+	return role;
 }
 
 export function validatePrompt(message: unknown, limits: ProtocolLimits = DEFAULT_PROTOCOL_LIMITS): string {
@@ -221,6 +246,8 @@ export function validateLaunchProfile(profile: LaunchProfile): LaunchProfile {
 	if (!path.isAbsolute(profile.cwd)) {
 		throw createProtocolError("launch profile cwd must be absolute");
 	}
+	if (profile.model !== undefined) validateModelReference(profile.model);
+	if (profile.thinking !== undefined) validateThinkingLevel(profile.thinking);
 	switch (profile.extensionLoading) {
 		case "inherit":
 		case "default":
