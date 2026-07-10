@@ -1,5 +1,5 @@
 export const PROTOCOL_VERSION = 2;
-export const STORE_VERSION = 2;
+export const STORE_VERSION = 3;
 export const MIN_READER_VERSION = 1;
 
 export const THREAD_MANAGER_NAME = "pi-thread-manager";
@@ -13,6 +13,7 @@ export type ThreadStatus =
 	| "stopped"
 	| "failed"
 	| "crashed"
+	| "approval_blocked"
 	| "kill_failed"
 	| "orphan_needs_manual_action";
 
@@ -32,7 +33,8 @@ export type ThreadAction =
 	| "approvals"
 	| "approve"
 	| "deny"
-	| "review_loop";
+	| "review_loop"
+	| "supervision";
 
 export type OperationKind =
 	| "create_thread"
@@ -75,6 +77,7 @@ export type ExtensionLoadingPolicy = "inherit" | "default" | "none";
 export type ApprovalMode = "inherit" | "ask" | "read_only";
 export type WorktreeMode = "isolated_required" | "shared_cwd_allowed" | "read_only";
 export type ThreadRole = "executor";
+export type ActionableThreadStatus = "idle" | "failed" | "crashed" | "approval_blocked";
 
 export interface LaunchProfile {
 	cwd: string;
@@ -271,6 +274,24 @@ export interface ThreadStoreDocument {
 	approvals: Record<string, ApprovalRecord>;
 	jobRuns: Record<string, JobRunRecord>;
 	commitPushDeliveries: Record<string, CommitPushDelivery>;
+	supervision: ThreadSupervisionState;
+}
+
+export interface ThreadSupervisionEvent {
+	id: string;
+	threadId: string;
+	status: ActionableThreadStatus;
+	createdAt: string;
+	lastActivityAt?: string;
+	error?: string;
+}
+
+export interface ThreadSupervisionState {
+	armed: boolean;
+	lastSeen: Record<string, string>;
+	pendingWakes: Record<string, ThreadSupervisionEvent>;
+	inFlightWakes: Record<string, ThreadSupervisionEvent>;
+	consumedEventIds: Record<string, string>;
 }
 
 export interface ProtocolLimits {
@@ -362,6 +383,14 @@ export interface ThreadReadResult {
 	nextCursor: number;
 	items: unknown[];
 	truncated: boolean;
+}
+
+export interface SupervisionSnapshot {
+	armed: boolean;
+	activeThreadCount: number;
+	pendingWakeCount: number;
+	inFlightWakeCount: number;
+	nextWake?: ThreadSupervisionEvent;
 }
 
 export interface DaemonStatus {

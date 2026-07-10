@@ -6,7 +6,7 @@ import { isPathInside, validateStoreVersion } from "../protocol.ts";
 import { MIN_READER_VERSION, STORE_VERSION, type ManagedThread, type ThreadStoreDocument, type ThreadWorktree } from "../types.ts";
 import { acquireFileLock, type LockOptions } from "./lock.ts";
 
-const THREAD_STATUSES = new Set(["creating", "starting", "idle", "running", "stopping", "stopped", "failed", "crashed", "kill_failed", "orphan_needs_manual_action"]);
+const THREAD_STATUSES = new Set(["creating", "starting", "idle", "running", "stopping", "stopped", "failed", "crashed", "approval_blocked", "kill_failed", "orphan_needs_manual_action"]);
 const OPERATION_KINDS = new Set(["create_thread", "send", "follow_up", "steer", "abort", "stop", "cleanup_worktree", "schedule_run", "approval", "child_ui_request", "commit_push_delivery", "review_loop"]);
 const OPERATION_STATUSES = new Set(["intent_recorded", "external_action_attempted", "acknowledged", "running", "approval_required", "cancelled", "completed", "failed", "unknown_after_restart", "reconciled", "manual_action_required"]);
 const SCHEDULE_TYPES = new Set(["review_loop", "custom"]);
@@ -42,6 +42,7 @@ export function createEmptyThreadStore(now: Date = new Date()): ThreadStoreDocum
 		approvals: {},
 		jobRuns: {},
 		commitPushDeliveries: {},
+		supervision: { armed: false, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} },
 	};
 }
 
@@ -142,7 +143,7 @@ export function parseThreadStore(raw: string, source: string, managerDir = getTh
 	}
 	const document = migrateThreadStoreDocument(parsed as Record<string, unknown>);
 	validateStoreVersion(document.storeVersion, document.minReaderVersion);
-	if (!isRecord(document.threads) || !isRecord(document.operations) || !isRecord(document.schedules) || !isRecord(document.approvals) || !isRecord(document.jobRuns) || !isRecord(document.commitPushDeliveries)) {
+	if (!isRecord(document.threads) || !isRecord(document.operations) || !isRecord(document.schedules) || !isRecord(document.approvals) || !isRecord(document.jobRuns) || !isRecord(document.commitPushDeliveries) || !isRecord(document.supervision)) {
 		throw new Error(`Invalid thread manager store at ${source}: missing record sections`);
 	}
 	const result = document as ThreadStoreDocument;
@@ -151,17 +152,28 @@ export function parseThreadStore(raw: string, source: string, managerDir = getTh
 }
 
 export function migrateThreadStoreDocument(document: Record<string, unknown>): Partial<ThreadStoreDocument> {
-	if (document.storeVersion !== 1) return document;
 	const migrated = document as Partial<ThreadStoreDocument>;
-	migrated.storeVersion = STORE_VERSION;
-	migrated.minReaderVersion = MIN_READER_VERSION;
-	migrated.migrationHistory = [...(Array.isArray(migrated.migrationHistory) ? migrated.migrationHistory : []), "v1_to_v2_thread_worktree_metadata"];
-	migrated.jobRuns = isRecord(migrated.jobRuns) ? migrated.jobRuns : {};
-	migrated.commitPushDeliveries = isRecord(migrated.commitPushDeliveries) ? migrated.commitPushDeliveries : {};
-	if (isRecord(migrated.threads)) {
-		for (const thread of Object.values(migrated.threads) as ManagedThread[]) {
-			thread.worktree ??= legacyWorktreeForThread(thread);
+	const storeVersion = document.storeVersion as number | undefined;
+	if (storeVersion === 1) {
+		(migrated as { storeVersion?: number }).storeVersion = 2;
+		migrated.minReaderVersion = MIN_READER_VERSION;
+		migrated.migrationHistory = [...(Array.isArray(migrated.migrationHistory) ? migrated.migrationHistory : []), "v1_to_v2_thread_worktree_metadata"];
+		migrated.jobRuns = isRecord(migrated.jobRuns) ? migrated.jobRuns : {};
+		migrated.commitPushDeliveries = isRecord(migrated.commitPushDeliveries) ? migrated.commitPushDeliveries : {};
+		if (isRecord(migrated.threads)) {
+			for (const thread of Object.values(migrated.threads) as ManagedThread[]) {
+				thread.worktree ??= legacyWorktreeForThread(thread);
+			}
 		}
+	}
+	if (storeVersion === 1 || (migrated.storeVersion as number | undefined) === 2) {
+		(migrated as { storeVersion?: number }).storeVersion = STORE_VERSION;
+		migrated.minReaderVersion = MIN_READER_VERSION;
+		migrated.migrationHistory = [...(Array.isArray(migrated.migrationHistory) ? migrated.migrationHistory : []), "v2_to_v3_supervision_state"];
+		migrated.supervision = normalizeSupervisionState(migrated.supervision);
+	}
+	if ((migrated.storeVersion as number | undefined) === STORE_VERSION && isRecord(migrated.supervision)) {
+		migrated.supervision = normalizeSupervisionState(migrated.supervision);
 	}
 	return migrated;
 }
@@ -176,6 +188,7 @@ export function assertThreadStoreInvariants(document: ThreadStoreDocument, manag
 		if (thread.currentOperationId && !document.operations[thread.currentOperationId]) throw new Error(`Thread ${id} references missing operation ${thread.currentOperationId}`);
 		if (thread.currentOperationId && document.operations[thread.currentOperationId].threadId !== id) throw new Error(`Thread ${id} references operation owned by another thread`);
 	}
+	assertSupervisionInvariants(document);
 	for (const [id, operation] of Object.entries(document.operations)) {
 		if (operation.id !== id) throw new Error(`Operation id mismatch for ${id}`);
 		assertAllowed(OPERATION_KINDS, operation.kind, `Operation ${id} kind`);
@@ -240,6 +253,30 @@ function assertThreadWorktreeInvariants(id: string, thread: ManagedThread): void
 	if (!isPathInside(worktree.sourceCwd, worktree.sourceRepoRoot)) throw new Error(`Thread ${id} isolated source cwd is outside source repo root`);
 	assertAllowed(new Set(["reserved", "allocated", "allocation_failed"]), worktree.allocationState, `Thread ${id} isolated allocation state`);
 	assertAllowed(new Set(["retained", "cleanup_pending", "removed", "manual_action_required"]), worktree.cleanupState, `Thread ${id} isolated cleanup state`);
+}
+
+function assertSupervisionInvariants(document: ThreadStoreDocument): void {
+	if (typeof document.supervision?.armed !== "boolean" || !isRecord(document.supervision.lastSeen) || !isRecord(document.supervision.pendingWakes) || !isRecord(document.supervision.inFlightWakes) || !isRecord(document.supervision.consumedEventIds)) {
+		throw new Error("Thread supervision state is invalid");
+	}
+	for (const [kind, events] of [["pending", document.supervision.pendingWakes], ["in-flight", document.supervision.inFlightWakes]] as const) {
+		for (const [id, event] of Object.entries(events)) {
+			if (event.id !== id || !document.threads[event.threadId] || !["idle", "failed", "crashed", "approval_blocked"].includes(event.status)) {
+				throw new Error(`Thread supervision ${kind} wake ${id} is invalid`);
+			}
+		}
+	}
+}
+
+function normalizeSupervisionState(value: unknown): ThreadStoreDocument["supervision"] {
+	const input = isRecord(value) ? value : {};
+	return {
+		armed: input.armed === true,
+		lastSeen: isRecord(input.lastSeen) ? input.lastSeen as Record<string, string> : {},
+		pendingWakes: isRecord(input.pendingWakes) ? input.pendingWakes as ThreadStoreDocument["supervision"]["pendingWakes"] : {},
+		inFlightWakes: isRecord(input.inFlightWakes) ? input.inFlightWakes as ThreadStoreDocument["supervision"]["inFlightWakes"] : {},
+		consumedEventIds: isRecord(input.consumedEventIds) ? input.consumedEventIds as Record<string, string> : {},
+	};
 }
 
 function assertAllowed(allowed: Set<string>, value: unknown, label: string): void {

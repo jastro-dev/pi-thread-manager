@@ -13,7 +13,7 @@ import type { ManagedThread, ThreadOperation } from "../src/types.ts";
 test("reads missing store as an empty versioned document", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-store-"));
 	const store = await readThreadStore(getThreadStorePath(root), getThreadManagerDir(root));
-	assert.equal(store.storeVersion, 2);
+	assert.equal(store.storeVersion, 3);
 	assert.deepEqual(store.threads, {});
 });
 
@@ -57,7 +57,7 @@ test("safe read treats future store versions as read-only without renaming prima
 	assert.equal(await fs.readFile(statePath, "utf8"), futureStore);
 });
 
-test("migrates v1 shared-cwd threads to v2 legacy worktree metadata", async () => {
+test("migrates v1 shared-cwd threads to v3 supervision metadata", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-store-"));
 	const managerDir = getThreadManagerDir(root);
 	const statePath = getThreadStorePath(root);
@@ -70,11 +70,12 @@ test("migrates v1 shared-cwd threads to v2 legacy worktree metadata", async () =
 	await fs.mkdir(path.dirname(statePath), { recursive: true });
 	await fs.writeFile(statePath, `${JSON.stringify(v1)}\n`, "utf8");
 	const migrated = await readThreadStore(statePath, managerDir);
-	assert.equal(migrated.storeVersion, 2);
+	assert.equal(migrated.storeVersion, 3);
 	assert.deepEqual(migrated.jobRuns, {});
 	assert.deepEqual(migrated.commitPushDeliveries, {});
 	assert.deepEqual(migrated.threads["thread-1"].worktree, { mode: "legacy_shared_cwd", sourceCwd: managerDir, cleanupState: "not_applicable" });
-	assert.deepEqual(migrated.migrationHistory, ["v1_to_v2_thread_worktree_metadata"]);
+	assert.deepEqual(migrated.supervision, { armed: false, lastSeen: {}, pendingWakes: {}, inFlightWakes: {}, consumedEventIds: {} });
+	assert.deepEqual(migrated.migrationHistory, ["v1_to_v2_thread_worktree_metadata", "v2_to_v3_supervision_state"]);
 });
 
 test("removes stale lock only when owning pid is dead", async () => {

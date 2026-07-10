@@ -190,7 +190,7 @@ export function applyUnknownAfterMissingHandle(document: ThreadStoreDocument, th
 
 export function applyThreadCrashedAfterReadFailure(document: ThreadStoreDocument, threadId: string, error: unknown, now: () => Date): void {
 	const thread = document.threads[threadId];
-	if (!thread || thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "orphan_needs_manual_action") return;
+	if (!thread || thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "orphan_needs_manual_action" || thread.status === "approval_blocked") return;
 	thread.status = "crashed";
 	thread.lastError = error instanceof Error ? error.message : String(error);
 	thread.updatedAt = now().toISOString();
@@ -209,7 +209,7 @@ export function summarizeStore(document: ThreadStoreDocument, storePath: string,
 		daemonEpoch,
 		storePath,
 		threadCount: threads.length,
-		activeThreadCount: threads.filter((thread) => ["creating", "starting", "idle", "running", "stopping"].includes(thread.status)).length,
+		activeThreadCount: threads.filter((thread) => ["creating", "starting", "idle", "running", "stopping", "approval_blocked"].includes(thread.status)).length,
 		orphanThreadCount: threads.filter((thread) => thread.status === "orphan_needs_manual_action").length,
 		isolatedThreadCount: threads.filter((thread) => thread.worktree?.mode === "isolated").length,
 		legacySharedCwdThreadCount: threads.filter((thread) => thread.worktree?.mode === "legacy_shared_cwd").length,

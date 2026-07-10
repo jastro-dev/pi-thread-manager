@@ -46,6 +46,7 @@ const THREAD_ACTIONS = new Set<ThreadAction>([
 	"approve",
 	"deny",
 	"review_loop",
+	"supervision",
 ]);
 
 export function byteLength(value: string): number {
@@ -295,6 +296,7 @@ export function isCommandAllowed(status: ThreadStatus, action: ThreadAction, saf
 		case "approve":
 		case "deny":
 		case "review_loop":
+		case "supervision":
 			return { allowed: true };
 		case "cleanup":
 			return ["stopped", "failed", "orphan_needs_manual_action"].includes(status)
@@ -317,7 +319,7 @@ export function isCommandAllowed(status: ThreadStatus, action: ThreadAction, saf
 				? { allowed: true }
 				: { allowed: false, reason: `abort requires running/stopping thread; current status is ${status}` };
 		case "stop":
-			return ["creating", "starting", "idle", "running", "stopping", "crashed", "kill_failed", "orphan_needs_manual_action"].includes(status)
+			return ["creating", "starting", "idle", "running", "stopping", "crashed", "approval_blocked", "kill_failed", "orphan_needs_manual_action"].includes(status)
 				? { allowed: true }
 				: { allowed: false, reason: `stop is not valid for ${status} thread` };
 		default: {

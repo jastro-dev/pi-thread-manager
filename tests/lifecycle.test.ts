@@ -60,6 +60,19 @@ test("injects executor role and disables orchestration extensions", async () => 
 	assert.match(String((rpc.calls[0] as { message: string }).message), /Managed executor contract/);
 });
 
+test("supervision service persists claim and acknowledgement state", async () => {
+	const { service, managerDir, rpc } = await createService();
+	rpc.state = { isStreaming: false, pendingMessageCount: 0, model: { provider: "openai", id: "test" }, thinkingLevel: "off" };
+	await service.createThread({ cwd: managerDir, model: "openai/test", createdBy: "test", safetyPolicy: sharedSafetyPolicy() });
+	const polled = await service.handleSupervision("poll") as { pendingWakeCount: number };
+	assert.equal(polled.pendingWakeCount, 1);
+	const claimed = await service.handleSupervision("claim") as { event: { id: string } };
+	assert.ok(claimed.event);
+	const acknowledged = await service.handleSupervision("ack", claimed.event.id) as { snapshot: { pendingWakeCount: number; inFlightWakeCount: number } };
+	assert.equal(acknowledged.snapshot.pendingWakeCount, 0);
+	assert.equal(acknowledged.snapshot.inFlightWakeCount, 0);
+});
+
 test("creates idle thread with explicit launch profile and pid", async () => {
 	const { service, statePath, managerDir, rpc } = await createService();
 	const thread = await service.createThread({ cwd: managerDir, model: "openai/test", name: "worker", createdBy: "test", safetyPolicy: sharedSafetyPolicy(), launchProfile: { inheritedFromParent: false } });

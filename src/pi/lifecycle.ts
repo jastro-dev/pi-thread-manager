@@ -31,6 +31,7 @@ import { ThreadWorktreeManager, type WorktreeCleanupResult, type WorktreeInspect
 import { ensureThreadPathsForManager } from "./session-files.ts";
 import { launchPiRpcThread, type LaunchedThreadProcess } from "./launcher.ts";
 import { injectExecutorRole } from "./executor-role.ts";
+import { acknowledgeWake, claimNextWake, consumeNextWake, observeThreadTransition, recoverInFlightWakes, rejectWake, supervisionSnapshot } from "./supervision.ts";
 import { discoverSessionFile, readSessionTranscript, realpathCwd, type TranscriptWindow } from "./session-transcript.ts";
 import {
 	applyCreateFailed,
@@ -57,6 +58,7 @@ import {
 	waitForChildExit,
 } from "./thread-transitions.ts";
 import type { PiRpcCommand, PiRpcState, PiRpcUiRequest } from "./rpc-client.ts";
+import type { SupervisionSnapshot, ThreadSupervisionEvent } from "../types.ts";
 
 export { isPassiveChildUiRequest, summarizeStore } from "./thread-transitions.ts";
 
@@ -159,6 +161,8 @@ export class ThreadService implements BrokerRequestHandler {
 				return this.createSchedule(params);
 			case "review_loop":
 				return this.createReviewLoop(params);
+			case "supervision":
+				return this.handleSupervision(String(params.operation ?? "poll"), params.eventId);
 			case "handshake":
 				return this.status();
 			default: {
@@ -181,6 +185,48 @@ export class ThreadService implements BrokerRequestHandler {
 		return Object.values(document.threads)
 			.filter((thread) => !context?.token || authorizeSecret(context.token, { action: "list", threadId: thread.id, cwd: authorizationCwd(thread) }, this.homeDir).allowed)
 			.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+	}
+
+	async handleSupervision(operation: string, eventId?: unknown): Promise<SupervisionSnapshot | { event?: ThreadSupervisionEvent; snapshot: SupervisionSnapshot }> {
+		if (!["poll", "arm", "disarm", "dequeue", "claim", "ack", "nack"].includes(operation)) throw new Error(`Unknown supervision operation: ${operation}`);
+		if (operation === "poll") {
+			await this.refreshLiveThreads();
+			await this.mutate((document) => recoverInFlightWakes(document.supervision));
+		}
+		if (operation === "arm" || operation === "disarm") {
+			await this.mutate((document) => {
+				document.supervision.armed = operation === "arm";
+			});
+		}
+		if (operation === "dequeue") {
+			const event = await this.mutate((document) => consumeNextWake(document.supervision, this.now().toISOString()));
+			return { event, snapshot: await this.readSupervisionSnapshot() };
+		}
+		if (operation === "claim") {
+			const event = await this.mutate((document) => claimNextWake(document.supervision));
+			return { event, snapshot: await this.readSupervisionSnapshot() };
+		}
+		if (operation === "ack" || operation === "nack") {
+			if (typeof eventId !== "string" || eventId.length === 0) throw new Error(`${operation} requires eventId`);
+			await this.mutate((document) => operation === "ack"
+				? acknowledgeWake(document.supervision, eventId, this.now().toISOString())
+				: rejectWake(document.supervision, eventId));
+			return { snapshot: await this.readSupervisionSnapshot() };
+		}
+		return await this.readSupervisionSnapshot();
+	}
+
+	private async readSupervisionSnapshot(): Promise<SupervisionSnapshot> {
+		const document = await readThreadStore(this.statePath, this.managerDir);
+		const activeThreadCount = Object.values(document.threads).filter((thread) => ["creating", "starting", "idle", "running", "stopping", "approval_blocked"].includes(thread.status)).length;
+		return supervisionSnapshot(document.supervision, activeThreadCount);
+	}
+
+	private async observeSupervision(): Promise<void> {
+		const now = this.now().toISOString();
+		await this.mutate((document) => {
+			for (const thread of Object.values(document.threads)) observeThreadTransition(document.supervision, thread, now);
+		});
 	}
 
 	async createThread(input: CreateThreadInput, requestId?: string): Promise<ManagedThread> {
@@ -309,6 +355,7 @@ export class ThreadService implements BrokerRequestHandler {
 				document.operations[operationId].updatedAt = this.now().toISOString();
 			});
 			if (input.initialPrompt) await this.sendToThread(id, "send", validatePrompt(input.initialPrompt));
+			await this.observeSupervision();
 			const document = await readThreadStore(this.statePath, this.managerDir);
 			return document.threads[id];
 		} catch (error) {
@@ -412,6 +459,7 @@ export class ThreadService implements BrokerRequestHandler {
 					document.operations[operationId].status = action === "send" || action === "follow_up" ? "acknowledged" : "completed";
 					document.operations[operationId].updatedAt = this.now().toISOString();
 				});
+				await this.observeSupervision();
 				return (await readThreadStore(this.statePath, this.managerDir)).operations[operationId];
 			} catch (error) {
 				await this.markCommandRejected(threadId, operationId, error, handle);
@@ -758,6 +806,7 @@ export class ThreadService implements BrokerRequestHandler {
 
 	private async refreshLiveThreads(): Promise<void> {
 		for (const threadId of this.handles.keys()) await this.refreshThreadState(threadId);
+		await this.observeSupervision();
 	}
 
 	private async refreshThreadState(threadId: string): Promise<void> {
@@ -771,7 +820,7 @@ export class ThreadService implements BrokerRequestHandler {
 			handle.rpc.destroy(error instanceof Error ? error : new Error(String(error)));
 			await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
 				const thread = document.threads[threadId];
-				if (!thread || thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed") return;
+				if (!thread || thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "approval_blocked") return;
 				thread.status = "crashed";
 				thread.lastError = error instanceof Error ? error.message : String(error);
 				thread.updatedAt = this.now().toISOString();
@@ -786,7 +835,7 @@ export class ThreadService implements BrokerRequestHandler {
 		await mutateThreadStore({ statePath: this.statePath, managerDir: this.managerDir, now: this.now }, (document) => {
 			const thread = document.threads[threadId];
 			if (!thread || thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "orphan_needs_manual_action") return;
-			if (thread.status === "stopping") return;
+			if (thread.status === "stopping" || thread.status === "approval_blocked") return;
 			const busy = state.isStreaming || (state.pendingMessageCount ?? 0) > 0;
 			const currentOperation = thread.currentOperationId ? document.operations[thread.currentOperationId] : undefined;
 			const undispatchedCurrentOperation = currentOperation && !isTerminalOperation(currentOperation.status) && currentOperation.status !== "acknowledged";
@@ -995,14 +1044,14 @@ export class ThreadService implements BrokerRequestHandler {
 			operation.updatedAt = this.now().toISOString();
 			if (thread.currentOperationId === operationId) thread.currentOperationId = undefined;
 			if (state) {
-				if (!["stopping", "stopped", "failed", "kill_failed", "orphan_needs_manual_action"].includes(thread.status)) {
+				if (!["stopping", "stopped", "failed", "kill_failed", "orphan_needs_manual_action", "approval_blocked"].includes(thread.status)) {
 					thread.status = state.isStreaming || (state.pendingMessageCount ?? 0) > 0 ? "running" : "idle";
 				}
 				thread.lastError = operationError;
 				thread.updatedAt = this.now().toISOString();
 				return;
 			}
-			if (thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "orphan_needs_manual_action") return;
+			if (thread.status === "stopped" || thread.status === "failed" || thread.status === "kill_failed" || thread.status === "orphan_needs_manual_action" || thread.status === "approval_blocked") return;
 			thread.status = "crashed";
 			thread.lastError = livenessError instanceof Error ? livenessError.message : String(livenessError ?? error);
 			thread.updatedAt = this.now().toISOString();
@@ -1027,6 +1076,7 @@ export class ThreadService implements BrokerRequestHandler {
 				error: `Child requested UI interaction: ${describeChildUiRequest(request)}`,
 			};
 			thread.lastError = document.operations[operationId].error;
+			thread.status = "approval_blocked";
 			thread.updatedAt = now;
 		});
 		return { cancelled: true, error: `Thread ${threadId} UI request ${request.id} requires manual action` };

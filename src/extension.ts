@@ -6,6 +6,7 @@ import { ThreadManagerClient } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { formatToolResult } from "./presentation.ts";
 import type { ThreadAction } from "./types.ts";
+import { SupervisionWatcher } from "./pi/supervision-watcher.ts";
 
 export interface BrokerPort {
 	connect(): Promise<unknown>;
@@ -16,6 +17,7 @@ export interface BrokerPort {
 export interface ThreadManagerExtensionDeps {
 	spawnBroker?: () => Promise<void>;
 	createClient?: () => BrokerPort;
+	supervisionIntervalMs?: number;
 }
 
 interface CommandPlan {
@@ -26,6 +28,19 @@ interface CommandPlan {
 export default function threadManagerExtension(pi: ExtensionAPI, deps: ThreadManagerExtensionDeps = {}): void {
 	const spawnBroker = deps.spawnBroker ?? (() => spawnBrokerIfNeeded());
 	const createClient = deps.createClient ?? (() => new ThreadManagerClient());
+	const eventApi = pi as unknown as { on?: ExtensionAPI["on"] };
+	if (typeof eventApi.on === "function") {
+		const watcher = new SupervisionWatcher({
+			spawnBroker,
+			createClient,
+			sendUserMessage: (content, options) => pi.sendUserMessage(content, options),
+			intervalMs: deps.supervisionIntervalMs,
+			onError: (error) => console.error(`Thread-manager supervision watcher failed: ${error instanceof Error ? error.message : String(error)}`),
+		});
+		eventApi.on("session_start", async () => watcher.start());
+		eventApi.on("session_shutdown", async () => watcher.stop());
+		eventApi.on("turn_end", async () => watcher.runTurnEndGuard());
+	}
 
 	pi.registerCommand("threads", {
 		description: "Create, inspect, message, stop, and cleanup daemon-backed Pi threads",
