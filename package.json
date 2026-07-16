@@ -7,6 +7,7 @@
 	"exports": "./src/index.ts",
 	"files": [
 		"src",
+		"skills",
 		"README.md",
 		"LICENSE"
 	],
@@ -24,6 +25,9 @@
 	"pi": {
 		"extensions": [
 			"./src/index.ts"
+		],
+		"skills": [
+			"./skills"
 		]
 	},
 	"peerDependencies": {

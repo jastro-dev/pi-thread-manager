@@ -2,7 +2,7 @@
 
 Daemon-backed long-lived Pi thread sessions for normal Pi.
 
-`pi-thread-manager` adds a `/threads` command and a model-facing `thread` tool. It lets a Pi session create, inspect, message, steer, stop, and clean up other long-lived Pi RPC sessions through a local broker daemon. Each thread has a stable id, launch profile, lifecycle state, logs, approval records, and optional isolated Git worktree.
+`pi-thread-manager` installs both the extension and its operator skill. The extension adds a `/threads` command and a model-facing `thread` tool, while the skill teaches Pi when and how to use them for durable worker sessions. It lets a Pi session create, inspect, message, steer, stop, and clean up other long-lived Pi RPC sessions through a local broker daemon. Each thread has a stable id, launch profile, lifecycle state, logs, approval records, and optional isolated Git worktree.
 
 Use it when one Pi session needs durable parallel work without losing track of child process state.
 
@@ -11,6 +11,14 @@ Use it when one Pi session needs durable parallel work without losing track of c
 ```bash
 pi install git:github.com/jastro-dev/pi-thread-manager
 ```
+
+Or install a local checkout:
+
+```bash
+pi install /path/to/pi-thread-manager
+```
+
+Either form installs the extension and the `pi-thread-manager` skill together.
 
 Then reload Pi:
 
